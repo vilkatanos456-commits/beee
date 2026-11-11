@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox с генерацией через Google Gemini AI.
-Управление кнопками и командами.
+Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox.
+- Генерация ников через Google Gemini (официальный SDK), пачками до 1500
+- Оценка ников (грейд S-D и редкость), команда /rate
+- Работает на Render и в PyCharm
 
-Установка:  pip install pyTelegramBotAPI requests redis openai
+Установка: pip install pyTelegramBotAPI requests redis google-genai
+Переменные окружения: TG_BOT_TOKEN, TG_CHAT_ID, AI_API_KEY, (REDIS_URL, PORT, CHECK_DELAY)
 """
 
 import html
@@ -26,28 +29,31 @@ import requests
 import telebot
 from telebot import types
 
-# Импортируем библиотеку для работы через OpenAI-совместимый интерфейс Google Gemini
 try:
-    from openai import OpenAI
+    from google import genai
+    from google.genai import types as gtypes
+
     AI_ENABLED = True
 except ImportError:
+    genai = None
+    gtypes = None
     AI_ENABLED = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("robloxbot")
+for _noisy in ("httpx", "httpcore", "google_genai", "urllib3", "TeleBot"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ===== НАСТРОЙКИ =====
-TOKEN = ""     # Токен бота (на Render берется из TG_BOT_TOKEN)
-ADMIN_ID = 0   # Твой ID (на Render берется из TG_CHAT_ID)
+TOKEN = ""  # Токен от @BotFather (или переменная TG_BOT_TOKEN)
+ADMIN_ID = 0  # Твой ID (или переменная TG_CHAT_ID)
 # =====================
 
 TOKEN = TOKEN or os.environ.get("TG_BOT_TOKEN", "")
 
-# Настройка клиента для Google Gemini через официальный OpenAI-совместимый эндпоинт Google
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
-AI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-
-ai_client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL) if AI_API_KEY and AI_ENABLED else None
+ai_client = (genai.Client(api_key=AI_API_KEY, http_options=gtypes.HttpOptions(timeout=20000))
+             if AI_API_KEY and AI_ENABLED else None)
 
 
 def _parse_ids(*chunks):
@@ -71,6 +77,9 @@ MAX_QUICK = 25
 MAX_THREADS = 12
 PANEL_EVERY = 10
 SAVE_EVERY = 30
+AI_DEFAULT = 300
+AI_MAX = 1500
+AI_BATCH = 500
 FOUND_FILE = "found.txt"
 CHECKED_FILE = "checked.txt"
 STATE_FILE = "state.json"
@@ -98,7 +107,7 @@ SHUTTING_DOWN = threading.Event()
 _delay_lock = threading.Lock()
 
 
-# ============================ хранилище ============================
+# ============================ ХРАНИЛИЩЕ ============================
 
 class Storage:
     def __init__(self):
@@ -190,7 +199,7 @@ def append_line(path, line):
             log.warning("Не удалось записать %s: %s", path, e)
 
 
-# ============================ ники ============================
+# ============================ НИКИ И АЛГОРИТМЫ ============================
 
 def valid_format(name):
     return bool(NAME_RE.match(name)) and not name.isdigit()
@@ -304,47 +313,232 @@ def make_names(spec):
         return iter(variant_names(spec["word"])[pos:])
     if kind == "words":
         return iter(spec["words"][pos:])
-    raise ValueError(f"неизвестный тип задачи: {kind}")
+    raise ValueError(f"Неизвестный тип задачи: {kind}")
 
 
-# ============================ ИИ Генератор ников (Gemini) ============================
+# ============================ ОЦЕНКА НИКОВ ============================
 
-# ============================ ИИ Генератор ников (Gemini) ============================
+WORDS = {
+    "fire", "ice", "dark", "light", "king", "queen", "wolf", "fox", "star", "moon", "sun", "storm",
+    "night", "ghost", "angel", "devil", "dragon", "shadow", "blade", "ninja", "hero", "zero", "neo",
+    "nova", "luna", "echo", "frost", "flame", "venom", "viper", "raven", "hawk", "tiger", "lion",
+    "bear", "wild", "cool", "epic", "rich", "gold", "silver", "iron", "steel", "stone", "rock",
+    "wind", "rain", "snow", "sky", "sea", "wave", "ash", "onyx", "ruby", "jade", "zen", "ace",
+    "max", "rex", "kai", "leo", "ivy", "eli", "ray", "sam", "alex", "jack", "john", "mike", "anna",
+}
+VOWELS = "aeiouy"
+LEN_POINTS = {3: 25, 4: 22, 5: 18, 6: 14, 7: 9, 8: 9}
+CONFUSABLE = ("il", "li", "ll", "rn", "1l", "l1", "o0", "0o", "iii", "lll")
 
-def generate_ai_names(prompt_topic, count=200):
+
+def _pronounceable(s):
+    if len(s) < 2 or not any(c in VOWELS for c in s):
+        return False
+    cons = vow = 0
+    for c in s:
+        if c in VOWELS:
+            vow += 1
+            cons = 0
+        else:
+            cons += 1
+            vow = 0
+        if cons >= 3 or vow >= 3:
+            return False
+    return True
+
+
+def _pattern_points(n):
+    L = len(n)
+    if L < 3:
+        return 0, ""
+    if len(set(n)) == 1:
+        return 20, "повтор"
+    diffs = {ord(n[i + 1]) - ord(n[i]) for i in range(L - 1)}
+    if n.isalpha() and diffs in ({1}, {-1}):
+        return 20, "алфавитный ряд"
+    for row in KEY_ROWS:
+        if n in row or n[::-1] in row:
+            return 20, "ряд клавиатуры"
+    if len(set(n)) == 2 and L >= 4 and all(n[i] == n[i % 2] for i in range(L)):
+        return 16, "чередование"
+    if n == n[::-1]:
+        return 16, "палиндром"
+    if L % 2 == 0 and n[:L // 2] == n[L // 2:]:
+        return 14, "двойной повтор"
+    return 0, ""
+
+
+def rate_name(name):
+    """Возвращает dict: score, grade, rarity, pattern, parts."""
+    n = name.lower()
+    L = len(n)
+    core = re.sub(r"[0-9_]", "", n)
+
+    length = LEN_POINTS.get(L, 4)
+
+    if core and core in WORDS:
+        meaning = 25
+    elif _pronounceable(core):
+        meaning = 15
+    else:
+        meaning = 5
+
+    pattern, pattern_name = _pattern_points(n)
+
+    if "_" in n:
+        chars = 5
+    elif any(c.isdigit() for c in n):
+        digit_inside = bool(re.search(r"[a-z][0-9]+[a-z]", n))
+        chars = 3 if digit_inside else 8
+    else:
+        chars = 15
+
+    if _pronounceable(core) and L <= 8:
+        sound = 15
+    elif _pronounceable(core):
+        sound = 8
+    else:
+        sound = 3
+
+    penalty = 0
+    if any(p in n for p in CONFUSABLE):
+        penalty += 5
+    if re.search(r"(.)\1\1", n) and len(set(n)) > 1:
+        penalty += 3
+    if L >= 9 and meaning < 25:
+        penalty += 2
+
+    score = max(0, min(100, length + meaning + pattern + chars + sound - penalty))
+
+    if score >= 90:
+        grade, rarity = "S", "💎 Очень редкий"
+    elif score >= 75:
+        grade, rarity = "A", "🔥 Редкий"
+    elif score >= 60:
+        grade, rarity = "B", "✨ Необычный"
+    elif score >= 40:
+        grade, rarity = "C", "🙂 Обычный"
+    else:
+        grade, rarity = "D", "🗑 Не редкий"
+
+    return {"score": score, "grade": grade, "rarity": rarity, "pattern": pattern_name,
+            "parts": (length, meaning, pattern, chars, sound, penalty)}
+
+
+def rating_line(name):
+    r = rate_name(name)
+    return f"{r['rarity']} · {r['grade']} ({r['score']}/100)"
+
+
+def rating_report(name):
+    r = rate_name(name)
+    ln, me, pa, ch, so, pen = r["parts"]
+    pat = f" ({r['pattern']})" if r["pattern"] else ""
+    return (f"<code>{html.escape(name)}</code> — {r['rarity']}\n"
+            f"Оценка: <b>{r['grade']}</b> · {r['score']}/100\n"
+            f"Длина {ln}/25 · Смысл {me}/25 · Паттерн {pa}/20{pat}\n"
+            f"Символы {ch}/15 · Звучание {so}/15 · Штраф −{pen}")
+
+
+# ============================ ИИ ГЕНЕРАТОР (GOOGLE GENAI) ============================
+
+PREFERRED_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
+_models_cache = []
+_bad_until = {}      # модель -> время, до которого её пропускаем
+_good_model = None   # последняя модель, которая ответила
+
+
+def pick_models():
+    """Модели, доступные ключу. Рабочая идёт первой, мёртвые и перегруженные пропускаются."""
+    global _models_cache
+    if not _models_cache:
+        try:
+            available = [m.name.replace("models/", "") for m in ai_client.models.list()]
+        except Exception as e:
+            log.warning("Не удалось получить список моделей: %s", e)
+            available = []
+        if available:
+            chosen = [m for m in PREFERRED_MODELS if m in available]
+            extra = [m for m in available
+                     if m.startswith("gemini-") and "flash" in m
+                     and not m.startswith("gemini-2")
+                     and m not in chosen
+                     and not any(x in m for x in ("image", "tts", "live", "audio", "embedding"))]
+            _models_cache = chosen + extra[:3]
+        else:
+            return list(PREFERRED_MODELS)
+
+    now = time.time()
+    models = [m for m in _models_cache if _bad_until.get(m, 0) <= now]
+    if _good_model in models:
+        models.remove(_good_model)
+        models.insert(0, _good_model)
+    return models or list(_models_cache)
+
+
+def _mark_bad(model_name, err):
+    msg = str(err)
+    if "404" in msg or "NOT_FOUND" in msg:
+        _bad_until[model_name] = float("inf")      # модель не существует для ключа
+    elif any(x in msg for x in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
+        _bad_until[model_name] = time.time() + 120  # перегружена, пропускаем 2 минуты
+
+
+def generate_ai_names(prompt_topic, count=AI_DEFAULT):
+    """Возвращает (names, error_text). Генерирует пачками, убирает дубли."""
+    global _good_model
     if not ai_client:
-        log.error("AI client не инициализирован (проверь AI_API_KEY на Render)")
-        return []
-    
-    system_prompt = (
-        "You are a creative cyberpunk and aesthetic username generator for Roblox. "
-        "Generate a list of unique, rare, cool usernames based on the user's theme. "
-        "Rules: Use only Latin letters, numbers, and underscores. Length between 3 and 12 characters. "
-        "No spaces. Return ONLY the raw list of usernames separated by spaces or newlines, nothing else."
-    )
-    
-    user_prompt = f"Theme: {prompt_topic}. Generate {count} unique names."
-    
-    try:
-        # Используем актуальный ID модели gemini-3.8-flash
-        response = ai_client.chat.completions.create(
-            model="gemini-3.8-flash",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.9,
-            max_tokens=2000
+        return [], "AI_API_KEY не задан или не установлен google-genai"
+
+    count = min(max(count, 1), AI_MAX)
+    config = gtypes.GenerateContentConfig(max_output_tokens=8192, temperature=1.0)
+    names, errors = [], []
+    rounds = 0
+
+    while len(names) < count and rounds < 8:
+        rounds += 1
+        want = min(AI_BATCH, count - len(names) + 40)
+        avoid = ", ".join(names[-40:])
+        prompt = (
+            f"You are a master gaming username designer.\n"
+            f"Take the theme: '{prompt_topic}' and transform it into {count} rare, clean usernames.\n\n"
+            f"STRICT RULES FOR GENERATION:\n"
+            f"1. THEMATIC VARIATIONS: Derive unique roots, Latin/Greek stems, and stylistic variations from the concept '{prompt_topic}'.\n"
+            f"2. TARGET LENGTHS: Strictly output names from 4 to 8 letters long (balanced mix of 4, 5, 6, 7, and 8 letters).\n"
+            f"3. CLEAN ONLY: Only Latin letters (A-Z). ABSOLUTELY NO numbers, NO underscores, NO trash like 'xX', 'pro', 'yt', '123'.\n"
+            f"4. PHONETICS: Must sound premium and pronounceable (e.g., theme 'shadow' -> 'gloom', 'umbra', 'nyxian', 'gloomix', 'shadowed').\n"
+            f"5. OUTPUT FORMAT: Return ONLY raw usernames separated by spaces or newlines. No numbers, no markdown, no bullets."
         )
-        content = response.choices[0].message.content
-        words = re.findall(r"\b[A-Za-z0-9_]{3,15}\b", content)
-        return list(dict.fromkeys(w.lower() for w in words if valid_format(w)))[:count]
-    except Exception as e:
-        log.exception(f"Критическая ошибка при запросе к Gemini ИИ: {e}")
-        return []
+        got = False
+        for model_name in pick_models():
+            try:
+                resp = ai_client.models.generate_content(
+                    model=model_name, contents=prompt, config=config)
+                words = re.findall(r"[A-Za-z0-9_]{3,15}", resp.text or "")
+                fresh = [w.lower() for w in words if valid_format(w.lower())]
+                before = len(names)
+                names = list(dict.fromkeys(names + fresh))
+                if len(names) > before:
+                    _good_model = model_name
+                    got = True
+                    break
+                errors.append(f"{model_name}: пустой ответ")
+            except Exception as e:
+                _mark_bad(model_name, e)
+                errors.append(f"{model_name}: {str(e)[:120]}")
+                log.warning("Gemini %s: %s", model_name, str(e)[:150])
+        if not got:
+            break
+        if len(names) < count:
+            time.sleep(1)
+
+    names = names[:count]
+    if names:
+        return names, None
+    return [], "\n".join(errors[-3:])
 
 
-# ============================ форматирование ============================
+# ============================ ФОРМАТИРОВАНИЕ И СТАТИСТИКА ============================
 
 def num(n):
     return f"{int(n):,}".replace(",", " ")
@@ -366,7 +560,7 @@ def fmt_duration(seconds):
     return f"~{seconds / 86400:.0f} дн."
 
 
-# ============================ Roblox check ============================
+# ============================ ПРОВЕРКА ROBLOX API ============================
 
 def check(session, name, stop, info=None):
     info = info if info is not None else {}
@@ -553,7 +747,7 @@ def register_found(name):
 def announce(chat_id, name):
     kb = types.InlineKeyboardMarkup()
     kb.row(button("🔄 Проверить", f"re:{name}"), button("✏️ Занять", url=ACCOUNT_URL))
-    say(chat_id, f"🟢 <b>Свободен ник:</b> <code>{name}</code>", kb)
+    say(chat_id, f"🟢 <b>Свободен ник:</b> <code>{name}</code>\n{rating_line(name)}", kb)
 
 
 def run_job(chat_id, job):
@@ -576,16 +770,16 @@ def run_job(chat_id, job):
             return idx, name, "stopped"
         session = session_pool.get()
         name = name.strip().lower()
-        
+
         if not valid_format(name):
             return idx, name, "invalid"
 
         if not is_file_or_custom and name in checked:
             return idx, name, "skipped"
-        
+
         job["current"] = name
         status = check(session, name, job["stop"], job)
-        
+
         if status == "free":
             time.sleep(0.1)
             again = check(session, name, job["stop"], job)
@@ -742,7 +936,8 @@ def send_status(chat_id):
     if job:
         say(chat_id, job["panel"].text() + f"\nПроверяется: <code>{job['current']}</code>")
     elif spec:
-        say(chat_id, f"⏸ На паузе: <b>{html.escape(spec['title'])}</b>\nПозиция: {num(spec['pos'])}\nПродолжить: /resume")
+        say(chat_id,
+            f"⏸ На паузе: <b>{html.escape(spec['title'])}</b>\nПозиция: {num(spec['pos'])}\nПродолжить: /resume")
     else:
         say(chat_id, "Ничего не запущено. Открой /menu")
 
@@ -770,13 +965,19 @@ def guard(m):
 
 
 HELP = (
-    "<b>Бот для поиска ников в Roblox (ИИ версия)</b>\n\n"
-    "/menu — меню\n"
-    "<code>/ai [тема]</code> — сгенерировать через Gemini ИИ и проверить (например: <code>/ai cyberpunk</code>)\n"
-    "/all4 /all5 — поиск по всем\n"
-    "/pretty 4 — красивые\n"
-    "/status /stop /resume — управление\n"
-    "/found — найденные"
+    "<b>Бот для поиска ников в Roblox (ИИ версия Gemini)</b>\n\n"
+    "/menu — главное меню\n"
+    f"<code>/ai [число] [тема]</code> — сгенерировать через Gemini и проверить "
+    f"(по умолчанию {AI_DEFAULT}, максимум {AI_MAX}). Пример: <code>/ai 1000 dark fantasy</code>\n"
+    "<code>/rate ник</code> — оценить ник (грейд и редкость)\n"
+    "<code>/name ник</code> — быстрая проверка ников\n"
+    "/all4 /all5 — поиск по всем комбинациям\n"
+    "/pretty 4 — красивый перебор\n"
+    "<code>/variants слово</code> — варианты слова\n"
+    "<code>/scan шаблон [кол-во]</code> — поиск по шаблону (? буква, # цифра)\n"
+    "/status /stop /resume — управление задачами\n"
+    "/found — список найденных, /export — файл\n"
+    "/delay — пауза между пачками"
 )
 
 
@@ -797,29 +998,45 @@ def cmd_help(m):
         say(m.chat.id, HELP)
 
 
-# Обработчик команды /ai [тема] с использованием Google Gemini
 @bot.message_handler(commands=["ai"])
 def cmd_ai(m):
     if not guard(m):
         return
     if not ai_client:
-        say(m.chat.id, "❌ ИИ не настроен! Проверь переменную <code>AI_API_KEY</code> на Render.")
+        say(m.chat.id, "❌ ИИ не настроен! Проверь переменную <code>AI_API_KEY</code>.")
         return
-    
+
     parts = m.text.split(maxsplit=1)
-    topic = parts[1] if len(parts) > 1 else "cyberpunk aesthetic"
-    
-    say(m.chat.id, f"🧠 Gemini ИИ генерирует ники по теме: <b>{html.escape(topic)}</b>...")
-    
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    count = AI_DEFAULT
+    first, _, tail = rest.partition(" ")
+    if first.isdigit():
+        count = min(max(int(first), 10), AI_MAX)
+        rest = tail.strip()
+    topic = rest or "cyberpunk aesthetic"
+
+    say(m.chat.id, f"🧠 Gemini генерирует до {count} ников по теме: <b>{html.escape(topic)}</b>...")
+
     def process_ai():
-        names = generate_ai_names(topic, count=300)
+        names, err = generate_ai_names(topic, count)
         if not names:
-            say(m.chat.id, "❌ Не удалось получить ники от Gemini ИИ.")
+            say(m.chat.id, f"❌ Gemini не ответил.\n<code>{html.escape(err or '')}</code>")
             return
-        say(m.chat.id, f"✅ ИИ сгенерировал {len(names)} уникальных ников. Запускаю проверку...")
+        say(m.chat.id, f"✅ ИИ сгенерировал {len(names)} ников. Запускаю проверку...")
         begin(m.chat.id, new_spec("words", f"ИИ (Gemini): {topic}", len(names), words=names))
 
     threading.Thread(target=process_ai, daemon=True).start()
+
+
+@bot.message_handler(commands=["rate"])
+def cmd_rate(m):
+    if not guard(m):
+        return
+    names = [x.lower() for x in re.split(r"[\s,;]+", m.text)[1:] if valid_format(x.lower())]
+    if not names:
+        say(m.chat.id, "Использование: <code>/rate ник1 ник2</code>")
+        return
+    say(m.chat.id, "\n\n".join(rating_report(x) for x in names[:15]))
 
 
 @bot.message_handler(commands=["all4", "all5"])
@@ -862,7 +1079,8 @@ def cmd_scan(m):
         pattern = args[0].lower()
         n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
         full = math.prod(len(o) for o in pattern_options(pattern))
-        begin(m.chat.id, new_spec("scan", f"Шаблон {pattern}", n or full, pattern=pattern, n=n, seed=random.randrange(2**31)))
+        begin(m.chat.id,
+              new_spec("scan", f"Шаблон {pattern}", n or full, pattern=pattern, n=n, seed=random.randrange(2 ** 31)))
 
 
 @bot.message_handler(content_types=["document"])
@@ -873,7 +1091,9 @@ def on_document(m):
     if (doc.file_name or "").lower().endswith(".txt"):
         data = tg(lambda: bot.download_file(bot.get_file(doc.file_id).file_path))
         if data:
-            names = list(dict.fromkeys(x.strip().lower() for x in data.decode("utf-8", "ignore").splitlines() if x.strip()))[:MAX_WORDS]
+            names = list(
+                dict.fromkeys(x.strip().lower() for x in data.decode("utf-8", "ignore").splitlines() if x.strip()))[
+                :MAX_WORDS]
             if names:
                 begin(m.chat.id, new_spec("words", f"Файл {doc.file_name}", len(names), words=names))
 
@@ -882,16 +1102,17 @@ def quick_check(chat_id, names):
     session = requests.Session()
     never = threading.Event()
     lines = []
-    for name in names:
+    for name in names[:MAX_QUICK]:
         if not valid_format(name):
-            lines.append(f"⚪ <code>{name}</code> — неверный формат")
+            lines.append(f"⚪ <code>{html.escape(name)}</code> — неверный формат")
             continue
         st = check(session, name, never)
-        lines.append({
-            "free": f"🟢 <code>{name}</code> — свободен",
+        label = {
+            "free": f"🟢 <code>{name}</code> — свободен · {rating_line(name)}",
             "taken": f"🔴 <code>{name}</code> — занят",
             "blocked": f"⛔ <code>{name}</code> — запрещен",
-        }.get(st, f"⚠️ <code>{name}</code> — ошибка"))
+        }.get(st, f"⚠️ <code>{name}</code> — ошибка")
+        lines.append(label)
         time.sleep(0.1)
     say(chat_id, "\n".join(lines))
 
@@ -932,7 +1153,9 @@ def found_text():
         names = list(state["found"])
     if not names:
         return "Пока ничего не найдено"
-    return f"Найдено свободных: {len(names)}:\n" + "\n".join(f"<code>{x}</code>" for x in names[-50:])
+    rated = sorted(names, key=lambda x: rate_name(x)["score"], reverse=True)[:50]
+    lines = [f"<code>{x}</code> — {rating_line(x)}" for x in rated]
+    return f"Найдено свободных: {len(names)} (топ по оценке):\n" + "\n".join(lines)
 
 
 @bot.message_handler(commands=["found"])
@@ -941,15 +1164,19 @@ def cmd_found(m):
         say(m.chat.id, found_text())
 
 
+def send_export(chat_id):
+    with state_lock:
+        names = list(state["found"])
+    if names:
+        bio = io.BytesIO("\n".join(names).encode("utf-8"))
+        bio.name = "found.txt"
+        tg(bot.send_document, chat_id, bio)
+
+
 @bot.message_handler(commands=["export"])
 def cmd_export(m):
     if guard(m):
-        with state_lock:
-            names = list(state["found"])
-        if names:
-            bio = io.BytesIO("\n".join(names).encode("utf-8"))
-            bio.name = "found.txt"
-            tg(bot.send_document, m.chat.id, bio)
+        send_export(m.chat.id)
 
 
 def set_delay(value):
@@ -1030,9 +1257,11 @@ class PingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"ok")
+
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
+
     def log_message(self, *args):
         pass
 
@@ -1058,18 +1287,18 @@ def shutdown(signum=None, frame=None):
 def main():
     start_ping_server()
     try:
-        # Сбрасываем старые зависшие вебхуки и обновления перед стартом
+        # Сброс старых подключений, чтобы избежать ошибки 409 Conflict
         bot.delete_webhook(drop_pending_updates=True)
         time.sleep(1)
         me = bot.get_me()
     except Exception as e:
         raise SystemExit(f"Ошибка Telegram: {e}")
-        
+
     log.info("Бот запущен: @%s", me.username)
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     resume_saved_jobs()
-    
+
     try:
         bot.infinity_polling(skip_pending=True, interval=0.5, timeout=20)
     except KeyboardInterrupt:
