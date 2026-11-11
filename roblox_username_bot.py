@@ -309,6 +309,8 @@ def make_names(spec):
 
 # ============================ ИИ Генератор ников (Gemini) ============================
 
+# ============================ ИИ Генератор ников (Gemini) ============================
+
 def generate_ai_names(prompt_topic, count=200):
     if not ai_client:
         log.error("AI client не инициализирован (проверь AI_API_KEY на Render)")
@@ -324,9 +326,9 @@ def generate_ai_names(prompt_topic, count=200):
     user_prompt = f"Theme: {prompt_topic}. Generate {count} unique names."
     
     try:
-        # Используем быструю и бесплатную модель gemini-2.5-flash от Google
+        # Используем актуальный ID модели gemini-3.8-flash
         response = ai_client.chat.completions.create(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
