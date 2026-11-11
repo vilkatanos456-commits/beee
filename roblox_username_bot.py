@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox (Ультра-скоростная версия).
+Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox с генерацией через ИИ.
 Управление кнопками и командами.
 
-Установка:  pip install pyTelegramBotAPI requests redis
+Установка:  pip install pyTelegramBotAPI requests redis openai
 """
 
 import html
@@ -26,6 +26,13 @@ import requests
 import telebot
 from telebot import types
 
+# Импортируем библиотеку для ИИ
+try:
+    from openai import OpenAI
+    AI_ENABLED = True
+except ImportError:
+    AI_ENABLED = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("robloxbot")
 
@@ -35,6 +42,11 @@ ADMIN_ID = 0   # твой chat id
 # =====================
 
 TOKEN = TOKEN or os.environ.get("TG_BOT_TOKEN", "")
+
+# Настройка клиента ИИ (поддерживает OpenRouter и OpenAI)
+AI_API_KEY = os.environ.get("AI_API_KEY", "")
+AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://openrouter.ai/api/v1") # по умолчанию OpenRouter (дешево/бесплатно)
+ai_client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL) if AI_API_KEY and AI_ENABLED else None
 
 
 def _parse_ids(*chunks):
@@ -48,15 +60,15 @@ def _parse_ids(*chunks):
 
 ADMIN_IDS = _parse_ids(ADMIN_ID, os.environ.get("TG_CHAT_ID", ""))
 
-DELAY = float(os.environ.get("CHECK_DELAY", "0.2"))  # Снижено до 0.2с для скорости
+DELAY = float(os.environ.get("CHECK_DELAY", "0.2"))
 MIN_DELAY, MAX_DELAY = 0.05, 15.0
 MAX_AUTO_DELAY = 5.0
 MAX_ERRORS = 50
 MAX_FULL = 20000
 MAX_WORDS = 5000
 MAX_QUICK = 25
-MAX_THREADS = 10       # Оптимально для скорости без мгновенного бана IP
-PANEL_EVERY = 10       # Редкие обновления панели, чтобы не спамить Telegram
+MAX_THREADS = 12
+PANEL_EVERY = 10
 SAVE_EVERY = 30
 FOUND_FILE = "found.txt"
 CHECKED_FILE = "checked.txt"
@@ -74,7 +86,7 @@ DIGITS = string.digits
 if not TOKEN:
     raise SystemExit("Нет токена: впиши его в TOKEN или задай переменную TG_BOT_TOKEN")
 
-bot = telebot.TeleBot(TOKEN, threaded=True) # Включаем встроенный пул потоков телебота
+bot = telebot.TeleBot(TOKEN, threaded=True)
 ApiError = getattr(getattr(telebot, "apihelper", None), "ApiTelegramException", Exception)
 
 jobs = {}
@@ -256,13 +268,11 @@ def pretty_names(n):
     return [x for x in dict.fromkeys(names) if valid_format(x)]
 
 
-LEET = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5", "t": "7", "b": "8", "g": "9", "l": "1"}
-PREFIXES = ["x", "xx", "xo", "mr", "its", "im", "the", "real", "pro", "my", "ur", "i"]
-SUFFIXES = ["x", "xx", "xd", "hd", "gg", "tv", "yt", "pro", "official", "rbx", "rblx",
-            "zz", "007", "123", "_x", "_gg"]
-
-
 def variant_names(word):
+    LEET = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5", "t": "7", "b": "8", "g": "9", "l": "1"}
+    PREFIXES = ["x", "xx", "xo", "mr", "its", "im", "the", "real", "pro", "my", "ur", "i"]
+    SUFFIXES = ["x", "xx", "xd", "hd", "gg", "tv", "yt", "pro", "official", "rbx", "rblx",
+                "zz", "007", "123", "_x", "_gg"]
     w = word.lower()
     out = [w]
     out += [w[:i] + w[i + 1:] for i in range(len(w))]
@@ -294,6 +304,41 @@ def make_names(spec):
     if kind == "words":
         return iter(spec["words"][pos:])
     raise ValueError(f"неизвестный тип задачи: {kind}")
+
+
+# ============================ ИИ Генератор ников ============================
+
+def generate_ai_names(prompt_topic, count=200):
+    if not ai_client:
+        return []
+    
+    system_prompt = (
+        "You are a creative cyberpunk and aesthetic username generator for Roblox. "
+        "Generate a list of unique, rare, cool usernames based on the user's theme. "
+        "Rules: Use only Latin letters, numbers, and underscores. Length between 3 and 12 characters. "
+        "No spaces. Return ONLY the raw list of usernames separated by spaces or newlines, nothing else."
+    )
+    
+    user_prompt = f"Theme: {prompt_topic}. Generate {count} unique names."
+    
+    try:
+        # Используем бесплатную или недорогую модель через OpenRouter/OpenAI (например, google/gemini-2.0-flash-exp:free или gpt-4o-mini)
+        response = ai_client.chat.completions.create(
+            model=os.environ.get("AI_MODEL", "google/gemini-2.0-flash-exp:free"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.9,
+            max_tokens=2000
+        )
+        content = response.choices[0].message.content
+        # Извлекаем слова с помощью регулярки
+        words = re.findall(r"\b[A-Za-z0-9_]{3,15}\b", content)
+        return list(dict.fromkeys(w.lower() for w in words if valid_format(w)))[:count]
+    except Exception as e:
+        log.error(f"Ошибка ИИ генерации: {e}")
+        return []
 
 
 # ============================ форматирование ============================
@@ -330,7 +375,7 @@ def check(session, name, stop, info=None):
             r = session.get(
                 URL,
                 params={"Username": name, "Birthday": BIRTHDAY, "Context": "Signup"},
-                timeout=5,  # Быстрый таймаут чтобы не вешать потоки
+                timeout=5,
             )
         except requests.RequestException:
             info["last_http"] = "нет связи"
@@ -361,8 +406,6 @@ def check(session, name, stop, info=None):
     return "error"
 
 
-# ============================ SessionPool ============================
-
 class SessionPool:
     def __init__(self, size):
         self._sessions = [requests.Session() for _ in range(size)]
@@ -380,8 +423,6 @@ class SessionPool:
             self._idx += 1
             return s
 
-
-# ============================ Telegram helpers ============================
 
 def tg(fn, *args, **kwargs):
     for _ in range(2):
@@ -435,8 +476,6 @@ def settings_markup():
     kb.row(button("➖ 0.1 с", "dl:-"), button("➕ 0.1 с", "dl:+"))
     return kb
 
-
-# ============================ задачи ============================
 
 def new_spec(kind, title, total, **extra):
     spec = {"kind": kind, "title": title, "total": total, "pos": 0, "running": True,
@@ -517,7 +556,7 @@ def announce(chat_id, name):
 def run_job(chat_id, job):
     spec = job["spec"]
     stats = spec["stats"]
-    track = spec["kind"] != "all"
+    is_file_or_custom = spec["kind"] in ("words", "variants", "pretty", "scan")
     panel = Panel(chat_id, job)
     job["panel"] = panel
     panel.send()
@@ -534,7 +573,11 @@ def run_job(chat_id, job):
             return idx, name, "stopped"
         session = session_pool.get()
         name = name.strip().lower()
-        if not valid_format(name) or (track and name in checked):
+        
+        if not valid_format(name):
+            return idx, name, "invalid"
+
+        if not is_file_or_custom and name in checked:
             return idx, name, "skipped"
         
         job["current"] = name
@@ -586,10 +629,10 @@ def run_job(chat_id, job):
                             continue
 
                         job["errors"] = 0
-                        if status in ("free", "taken", "blocked", "skipped"):
-                            if status != "skipped":
+                        if status in ("free", "taken", "blocked", "skipped", "invalid"):
+                            if status not in ("skipped", "invalid"):
                                 stats["checked"] += 1
-                            if track and status != "skipped":
+                            if not is_file_or_custom and status not in ("skipped", "invalid"):
                                 checked.add(name)
                                 append_line(CHECKED_FILE, name)
                             if status == "free":
@@ -597,7 +640,6 @@ def run_job(chat_id, job):
                                 register_found(name)
                                 announce(chat_id, name)
 
-                        # Плавное сокращение задержки обратно при стабильной работе
                         with _delay_lock:
                             current_delay = DELAY
                         job["delay"] = max(current_delay, job["delay"] * 0.98)
@@ -725,8 +767,9 @@ def guard(m):
 
 
 HELP = (
-    "<b>Бот для поиска ников в Roblox (Ультра)</b>\n\n"
+    "<b>Бот для поиска ников в Roblox (ИИ версия)</b>\n\n"
     "/menu — меню\n"
+    "<code>/ai [тема]</code> — сгенерировать через ИИ и проверить (например: <code>/ai cyberpunk</code>)\n"
     "/all4 /all5 — поиск по всем\n"
     "/pretty 4 — красивые\n"
     "/status /stop /resume — управление\n"
@@ -749,6 +792,32 @@ def cmd_start(m):
 def cmd_help(m):
     if guard(m):
         say(m.chat.id, HELP)
+
+
+# Обработчик команды /ai [тема]
+@bot.message_handler(commands=["ai"])
+def cmd_ai(m):
+    if not guard(m):
+        return
+    if not ai_client:
+        say(m.chat.id, "❌ ИИ не настроен! Добавь переменную окружения <code>AI_API_KEY</code> на Render.")
+        return
+    
+    parts = m.text.split(maxsplit=1)
+    topic = parts[1] if len(parts) > 1 else "cyberpunk aesthetic"
+    
+    say(m.chat.id, f"🧠 Нейросеть генерирует ники по теме: <b>{html.escape(topic)}</b>...")
+    
+    # Запускаем генерацию в отдельном потоке, чтобы не морозить бота
+    def process_ai():
+        names = generate_ai_names(topic, count=300)
+        if not names:
+            say(m.chat.id, "❌ Не удалось получить ники от ИИ.")
+            return
+        say(m.chat.id, f"✅ ИИ сгенерировал {len(names)} уникальных ников. Запускаю проверку...")
+        begin(m.chat.id, new_spec("words", f"ИИ: {topic}", len(names), words=names))
+
+    threading.Thread(target=process_ai, daemon=True).start()
 
 
 @bot.message_handler(commands=["all4", "all5"])
