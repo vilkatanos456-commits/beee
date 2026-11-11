@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox с генерацией через ИИ.
+Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox с генерацией через Google Gemini AI.
 Управление кнопками и командами.
 
 Установка:  pip install pyTelegramBotAPI requests redis openai
@@ -26,7 +26,7 @@ import requests
 import telebot
 from telebot import types
 
-# Импортируем библиотеку для ИИ
+# Импортируем библиотеку для работы через OpenAI-совместимый интерфейс Google Gemini
 try:
     from openai import OpenAI
     AI_ENABLED = True
@@ -37,15 +37,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefm
 log = logging.getLogger("robloxbot")
 
 # ===== НАСТРОЙКИ =====
-TOKEN = ""     # токен от @BotFather
-ADMIN_ID = 0   # твой chat id
+TOKEN = ""     # Токен бота (на Render берется из TG_BOT_TOKEN)
+ADMIN_ID = 0   # Твой ID (на Render берется из TG_CHAT_ID)
 # =====================
 
 TOKEN = TOKEN or os.environ.get("TG_BOT_TOKEN", "")
 
-# Настройка клиента ИИ (поддерживает OpenRouter и OpenAI)
+# Настройка клиента для Google Gemini через официальный OpenAI-совместимый эндпоинт Google
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
-AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://openrouter.ai/api/v1") # по умолчанию OpenRouter (дешево/бесплатно)
+AI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
 ai_client = OpenAI(api_key=AI_API_KEY, base_url=AI_BASE_URL) if AI_API_KEY and AI_ENABLED else None
 
 
@@ -306,10 +307,11 @@ def make_names(spec):
     raise ValueError(f"неизвестный тип задачи: {kind}")
 
 
-# ============================ ИИ Генератор ников ============================
+# ============================ ИИ Генератор ников (Gemini) ============================
 
 def generate_ai_names(prompt_topic, count=200):
     if not ai_client:
+        log.error("AI client не инициализирован (проверь AI_API_KEY на Render)")
         return []
     
     system_prompt = (
@@ -322,9 +324,9 @@ def generate_ai_names(prompt_topic, count=200):
     user_prompt = f"Theme: {prompt_topic}. Generate {count} unique names."
     
     try:
-        # Используем бесплатную или недорогую модель через OpenRouter/OpenAI (например, google/gemini-2.0-flash-exp:free или gpt-4o-mini)
+        # Используем быструю и бесплатную модель gemini-2.5-flash от Google
         response = ai_client.chat.completions.create(
-            model=os.environ.get("AI_MODEL", "google/gemini-2.0-flash-exp:free"),
+            model="gemini-2.5-flash",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -333,11 +335,10 @@ def generate_ai_names(prompt_topic, count=200):
             max_tokens=2000
         )
         content = response.choices[0].message.content
-        # Извлекаем слова с помощью регулярки
         words = re.findall(r"\b[A-Za-z0-9_]{3,15}\b", content)
         return list(dict.fromkeys(w.lower() for w in words if valid_format(w)))[:count]
     except Exception as e:
-        log.error(f"Ошибка ИИ генерации: {e}")
+        log.exception(f"Критическая ошибка при запросе к Gemini ИИ: {e}")
         return []
 
 
@@ -769,7 +770,7 @@ def guard(m):
 HELP = (
     "<b>Бот для поиска ников в Roblox (ИИ версия)</b>\n\n"
     "/menu — меню\n"
-    "<code>/ai [тема]</code> — сгенерировать через ИИ и проверить (например: <code>/ai cyberpunk</code>)\n"
+    "<code>/ai [тема]</code> — сгенерировать через Gemini ИИ и проверить (например: <code>/ai cyberpunk</code>)\n"
     "/all4 /all5 — поиск по всем\n"
     "/pretty 4 — красивые\n"
     "/status /stop /resume — управление\n"
@@ -794,28 +795,27 @@ def cmd_help(m):
         say(m.chat.id, HELP)
 
 
-# Обработчик команды /ai [тема]
+# Обработчик команды /ai [тема] с использованием Google Gemini
 @bot.message_handler(commands=["ai"])
 def cmd_ai(m):
     if not guard(m):
         return
     if not ai_client:
-        say(m.chat.id, "❌ ИИ не настроен! Добавь переменную окружения <code>AI_API_KEY</code> на Render.")
+        say(m.chat.id, "❌ ИИ не настроен! Проверь переменную <code>AI_API_KEY</code> на Render.")
         return
     
     parts = m.text.split(maxsplit=1)
     topic = parts[1] if len(parts) > 1 else "cyberpunk aesthetic"
     
-    say(m.chat.id, f"🧠 Нейросеть генерирует ники по теме: <b>{html.escape(topic)}</b>...")
+    say(m.chat.id, f"🧠 Gemini ИИ генерирует ники по теме: <b>{html.escape(topic)}</b>...")
     
-    # Запускаем генерацию в отдельном потоке, чтобы не морозить бота
     def process_ai():
         names = generate_ai_names(topic, count=300)
         if not names:
-            say(m.chat.id, "❌ Не удалось получить ники от ИИ.")
+            say(m.chat.id, "❌ Не удалось получить ники от Gemini ИИ.")
             return
         say(m.chat.id, f"✅ ИИ сгенерировал {len(names)} уникальных ников. Запускаю проверку...")
-        begin(m.chat.id, new_spec("words", f"ИИ: {topic}", len(names), words=names))
+        begin(m.chat.id, new_spec("words", f"ИИ (Gemini): {topic}", len(names), words=names))
 
     threading.Thread(target=process_ai, daemon=True).start()
 
