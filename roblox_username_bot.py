@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox (Многопоточная версия).
+Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox (Ультра-скоростная версия).
 Управление кнопками и командами.
 
 Установка:  pip install pyTelegramBotAPI requests redis
@@ -30,8 +30,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefm
 log = logging.getLogger("robloxbot")
 
 # ===== НАСТРОЙКИ =====
-TOKEN = ""     # вставь токен от @BotFather ВНУТРИ кавычек (или задай TG_BOT_TOKEN)
-ADMIN_ID = 0   # твой chat id (или задай TG_CHAT_ID). Не знаешь — оставь 0 и напиши боту /start
+TOKEN = ""     # токен от @BotFather
+ADMIN_ID = 0   # твой chat id
 # =====================
 
 TOKEN = TOKEN or os.environ.get("TG_BOT_TOKEN", "")
@@ -48,15 +48,15 @@ def _parse_ids(*chunks):
 
 ADMIN_IDS = _parse_ids(ADMIN_ID, os.environ.get("TG_CHAT_ID", ""))
 
-DELAY = float(os.environ.get("CHECK_DELAY", "1.0"))
-MIN_DELAY, MAX_DELAY = 0.2, 30.0
-MAX_AUTO_DELAY = 10.0
-MAX_ERRORS = 30
+DELAY = float(os.environ.get("CHECK_DELAY", "0.2"))  # Снижено до 0.2с для скорости
+MIN_DELAY, MAX_DELAY = 0.05, 15.0
+MAX_AUTO_DELAY = 5.0
+MAX_ERRORS = 50
 MAX_FULL = 20000
 MAX_WORDS = 5000
 MAX_QUICK = 25
-MAX_THREADS = 10
-PANEL_EVERY = 30
+MAX_THREADS = 12       # Оптимально для скорости без мгновенного бана IP
+PANEL_EVERY = 10       # Редкие обновления панели, чтобы не спамить Telegram
 SAVE_EVERY = 30
 FOUND_FILE = "found.txt"
 CHECKED_FILE = "checked.txt"
@@ -74,7 +74,7 @@ DIGITS = string.digits
 if not TOKEN:
     raise SystemExit("Нет токена: впиши его в TOKEN или задай переменную TG_BOT_TOKEN")
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, threaded=True) # Включаем встроенный пул потоков телебота
 ApiError = getattr(getattr(telebot, "apihelper", None), "ApiTelegramException", Exception)
 
 jobs = {}
@@ -322,20 +322,20 @@ def fmt_duration(seconds):
 
 def check(session, name, stop, info=None):
     info = info if info is not None else {}
-    backoff = 3
-    for _ in range(5):
+    backoff = 1
+    for _ in range(3):
         if stop.is_set():
             return "stopped"
         try:
             r = session.get(
                 URL,
                 params={"Username": name, "Birthday": BIRTHDAY, "Context": "Signup"},
-                timeout=12,
+                timeout=5,  # Быстрый таймаут чтобы не вешать потоки
             )
         except requests.RequestException:
             info["last_http"] = "нет связи"
             stop.wait(backoff)
-            backoff = min(backoff * 2, 60)
+            backoff = min(backoff * 2, 10)
             continue
 
         if r.status_code == 429:
@@ -344,17 +344,14 @@ def check(session, name, stop, info=None):
                 wait = int(r.headers.get("Retry-After", backoff))
             except (TypeError, ValueError):
                 wait = backoff
-            stop.wait(min(max(wait, 1), 120))
-            backoff = min(backoff * 2, 120)
-            continue
+            stop.wait(min(max(wait, 0.5), 30))
+            return "limited"
 
         if r.status_code != 200:
-            info["last_http"] = f"HTTP {r.status_code}"
             return "error"
         try:
             code = r.json().get("code")
         except ValueError:
-            info["last_http"] = "странный ответ"
             return "error"
         if code == 0:
             return "free"
@@ -367,11 +364,13 @@ def check(session, name, stop, info=None):
 # ============================ SessionPool ============================
 
 class SessionPool:
-    """Пул сессий для потокобезопасного reuse."""
     def __init__(self, size):
         self._sessions = [requests.Session() for _ in range(size)]
         for s in self._sessions:
-            s.headers["User-Agent"] = "Mozilla/5.0 (username-checker)"
+            s.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Encoding": "gzip, deflate",
+            })
         self._lock = threading.Lock()
         self._idx = 0
 
@@ -385,20 +384,17 @@ class SessionPool:
 # ============================ Telegram helpers ============================
 
 def tg(fn, *args, **kwargs):
-    for _ in range(3):
+    for _ in range(2):
         try:
             return fn(*args, **kwargs)
         except ApiError as e:
             if "message is not modified" in str(e):
                 return None
             if getattr(e, "error_code", None) == 429:
-                params = (getattr(e, "result_json", None) or {}).get("parameters", {})
-                time.sleep(min(int(params.get("retry_after", 5)) + 1, 60))
+                time.sleep(2)
                 continue
-            log.warning("Telegram API: %s", e)
             return None
-        except Exception as e:
-            log.warning("Telegram: %s", e)
+        except Exception:
             return None
     return None
 
@@ -430,13 +426,13 @@ def panel_markup():
 def settings_text():
     with _delay_lock:
         d = DELAY
-    return (f"⚙️ Базовая пауза: <b>{d:.1f} с</b> (потоков: {MAX_THREADS})\n"
-            "Бот автоматически ускоряет или замедляет проверку при нагрузке.")
+    return (f"⚙️ Пауза: <b>{d:.2f} с</b> (потоков: {MAX_THREADS})\n"
+            "Бот настроен на максимальную скорость проверки.")
 
 
 def settings_markup():
     kb = types.InlineKeyboardMarkup()
-    kb.row(button("➖ 0.3 с", "dl:-"), button("➕ 0.3 с", "dl:+"))
+    kb.row(button("➖ 0.1 с", "dl:-"), button("➕ 0.1 с", "dl:+"))
     return kb
 
 
@@ -451,8 +447,8 @@ def new_spec(kind, title, total, **extra):
 
 def new_job(spec):
     return {"stop": threading.Event(), "spec": spec, "t0": time.time(), "pos0": spec["pos"],
-            "current": "параллельный поиск...", "delay": DELAY, "errors": 0,
-            "limited": 0, "last_http": None, "panel": None, "thread": None}
+            "current": "ультра-поиск...", "delay": DELAY, "errors": 0,
+            "limited": 0, "panel": None, "thread": None}
 
 
 class Panel:
@@ -472,19 +468,19 @@ class Panel:
         moved = pos - job["pos0"]
         with _delay_lock:
             delay = DELAY
-        rate = moved / elapsed if (elapsed > 30 and moved >= 10) else MAX_THREADS / (delay + 0.3)
+        rate = moved / elapsed if (elapsed > 10 and moved >= 5) else MAX_THREADS / (delay + 0.1)
         eta = (total - pos) / rate if rate > 0 else 0
         head = {None: "⏳", "done": "🏁", "stopped": "⏸", "blocked": "⚠️", "crashed": "💥"}[status]
         lines = [
             f"{head} <b>{html.escape(spec['title'])}</b>",
             f"{bar(frac)} {frac * 100:.1f}%  ({num(pos)} из {num(total)})",
-            f"🟢 Найдено свободных: <b>{st['free']}</b>    ·    проверено: {num(st['checked'])}",
+            f"🟢 Свободных: <b>{st['free']}</b>    ·    проверено: {num(st['checked'])}",
         ]
         if status is None:
             lines.append(f"⚡ ~{rate * 60:.0f} ников/мин (потоков: {MAX_THREADS})")
             lines.append(f"🕒 Осталось: {fmt_duration(eta)}")
         if st["limited"]:
-            lines.append(f"🚦 Лимитов (429): {st['limited']} — бот снижает скорость")
+            lines.append(f"🚦 Лимитов (429): {st['limited']}")
         return "\n".join(lines)
 
     def send(self):
@@ -514,7 +510,7 @@ def register_found(name):
 
 def announce(chat_id, name):
     kb = types.InlineKeyboardMarkup()
-    kb.row(button("🔄 Проверить", f"re:{name}"), button("✏️ Занять на Roblox", url=ACCOUNT_URL))
+    kb.row(button("🔄 Проверить", f"re:{name}"), button("✏️ Занять", url=ACCOUNT_URL))
     say(chat_id, f"🟢 <b>Свободен ник:</b> <code>{name}</code>", kb)
 
 
@@ -532,45 +528,49 @@ def run_job(chat_id, job):
     outcome = "done"
     session_pool = SessionPool(MAX_THREADS)
 
-    def worker_check(name):
+    def worker_check(args):
+        idx, name = args
         if job["stop"].is_set():
-            return name, "stopped"
+            return idx, name, "stopped"
         session = session_pool.get()
         name = name.strip().lower()
         if not valid_format(name) or (track and name in checked):
-            return name, "skipped"
+            return idx, name, "skipped"
+        
         job["current"] = name
         status = check(session, name, job["stop"], job)
+        
         if status == "free":
-            time.sleep(0.3)
+            time.sleep(0.1)
             again = check(session, name, job["stop"], job)
             if again in ("taken", "blocked"):
                 status = again
-        return name, status
+        return idx, name, status
 
     try:
-        chunk_size = MAX_THREADS * 3
+        chunk_size = MAX_THREADS * 5
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             while not job["stop"].is_set():
                 batch = []
                 for _ in range(chunk_size):
                     try:
                         name = next(name_iterator)
-                        batch.append(name)
+                        batch.append((base, name))
                         base += 1
                     except StopIteration:
                         break
                 if not batch:
                     break
-                futures = {executor.submit(worker_check, n): n for n in batch}
-                results = {}
+
+                futures = [executor.submit(worker_check, item) for item in batch]
                 for future in as_completed(futures):
                     if job["stop"].is_set():
                         outcome = "stopped"
                         break
                     try:
-                        name, status = future.result()
-                        results[name] = status
+                        idx, name, status = future.result()
+                        spec["pos"] = idx + 1
+
                         if status == "stopped":
                             outcome = "stopped"
                             break
@@ -580,32 +580,40 @@ def run_job(chat_id, job):
                                 outcome = "blocked"
                                 break
                             continue
+                        if status == "limited":
+                            stats["limited"] += 1
+                            job["delay"] = min(job["delay"] * 1.2 + 0.1, MAX_AUTO_DELAY)
+                            continue
+
                         job["errors"] = 0
-                        if status in ("free", "taken", "blocked"):
-                            stats["checked"] += 1
-                            if track:
+                        if status in ("free", "taken", "blocked", "skipped"):
+                            if status != "skipped":
+                                stats["checked"] += 1
+                            if track and status != "skipped":
                                 checked.add(name)
                                 append_line(CHECKED_FILE, name)
                             if status == "free":
                                 stats["free"] += 1
                                 register_found(name)
                                 announce(chat_id, name)
-                        if job["limited"] > 0:
-                            job["delay"] = min(job["delay"] * 1.3 + 0.1, MAX_AUTO_DELAY)
-                            job["limited"] = 0
-                        else:
-                            job["delay"] = max(DELAY, job["delay"] * 0.95)
+
+                        # Плавное сокращение задержки обратно при стабильной работе
+                        with _delay_lock:
+                            current_delay = DELAY
+                        job["delay"] = max(current_delay, job["delay"] * 0.98)
+
                     except Exception:
-                        log.exception("Ошибка в потоке проверки")
+                        pass
+
                 panel.update()
                 persist()
-                job["stop"].wait(job["delay"])
+                if job["delay"] > 0:
+                    job["stop"].wait(job["delay"])
+
                 if outcome != "done":
                     break
-        spec["pos"] = base
 
     except Exception:
-        log.exception("Сбой в задаче")
         outcome = "crashed"
     finally:
         with jobs_lock:
@@ -628,13 +636,11 @@ def _finish_job(chat_id, job, outcome):
     job["panel"].update(force=True, status=outcome)
     tail = f"Проверено: {num(stats['checked'])}, свободных: {stats['free']}."
     if outcome == "done":
-        text = f"🏁 Готово: {html.escape(spec['title'])}. {tail}\nВсе найденные: /found"
+        text = f"🏁 Готово: {html.escape(spec['title'])}. {tail}\n/found"
     elif outcome == "stopped":
-        text = f"⏹ Остановлено на позиции {num(spec['pos'])} из {num(spec['total'])}. {tail}\nПродолжить: /resume"
-    elif outcome == "blocked":
-        text = f"⚠️ Превышен лимит ошибок. Бот на паузе. {tail}\nВозобновить: /resume"
+        text = f"⏹ Остановлено на позиции {num(spec['pos'])}. {tail}\nПродолжить: /resume"
     else:
-        text = f"💥 Задача остановлена из-за ошибки. {tail}\nПопробуй /resume"
+        text = f"⚠️ Превышен лимит ошибок. Пауза. {tail}\n/resume"
     say(chat_id, text)
 
 
@@ -645,7 +651,7 @@ def begin(chat_id, spec):
             job = new_job(spec)
             jobs[chat_id] = job
     if busy:
-        say(chat_id, "Уже идёт проверка. Смотри /status или останови /stop")
+        say(chat_id, "Уже идет проверка. Смотри /status или останови /stop")
         return False
     spec["running"] = True
     with state_lock:
@@ -671,7 +677,7 @@ def start_pretty(chat_id, n):
 def resume_job(chat_id):
     spec = state["jobs"].get(str(chat_id))
     if chat_id in jobs:
-        say(chat_id, "Проверка уже идёт: /status")
+        say(chat_id, "Проверка уже идет: /status")
     elif not spec:
         say(chat_id, "Нет приостановленных задач.")
     else:
@@ -682,7 +688,6 @@ def resume_job(chat_id):
 def resume_saved_jobs():
     for cid, spec in list(state["jobs"].items()):
         if spec.get("running") and int(cid) not in jobs:
-            say(int(cid), f"♻️ Бот перезапущен — продолжаю: <b>{html.escape(spec['title'])}</b>")
             begin(int(cid), spec)
 
 
@@ -692,10 +697,9 @@ def send_status(chat_id):
     if job:
         say(chat_id, job["panel"].text() + f"\nПроверяется: <code>{job['current']}</code>")
     elif spec:
-        say(chat_id, f"⏸ На паузе: <b>{html.escape(spec['title'])}</b>\n"
-                     f"Позиция {num(spec['pos'])} из {num(spec['total'])}\nПродолжить: /resume")
+        say(chat_id, f"⏸ На паузе: <b>{html.escape(spec['title'])}</b>\nПозиция: {num(spec['pos'])}\nПродолжить: /resume")
     else:
-        say(chat_id, "Сейчас ничего не запущено. Открой /menu")
+        say(chat_id, "Ничего не запущено. Открой /menu")
 
 
 def stop_job(chat_id):
@@ -716,19 +720,17 @@ def guard(m):
     if not ADMIN_IDS:
         tg(bot.reply_to, m, f"🔧 Твой chat id: <code>{m.chat.id}</code>. Впиши его в ADMIN_ID.", parse_mode="HTML")
     else:
-        tg(bot.reply_to, m, f"⛔ Доступ закрыт. Твой ID: <code>{m.chat.id}</code>", parse_mode="HTML")
+        tg(bot.reply_to, m, f"⛔ Доступ закрыт. ID: <code>{m.chat.id}</code>", parse_mode="HTML")
     return False
 
 
 HELP = (
-    "<b>Бот для поиска ников в Roblox (Multi-Thread)</b>\n\n"
-    "/menu — меню с кнопками\n"
-    "<code>/all4</code> · <code>/all5</code> — поиск по всем 4- и 5-буквенным\n"
-    "<code>/pretty 4</code> — красивые ники\n"
-    "<code>/variants word</code> — варианты слова\n"
-    "<code>/scan ?#?#</code> — по шаблону\n"
-    "/status · /stop · /resume — управление\n"
-    "/found — список найденных"
+    "<b>Бот для поиска ников в Roblox (Ультра)</b>\n\n"
+    "/menu — меню\n"
+    "/all4 /all5 — поиск по всем\n"
+    "/pretty 4 — красивые\n"
+    "/status /stop /resume — управление\n"
+    "/found — найденные"
 )
 
 
@@ -765,10 +767,8 @@ def cmd_pretty(m):
         return
     parts = m.text.split()
     n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 4
-    if not 3 <= n <= 6:
-        tg(bot.reply_to, m, "Длина от 3 до 6, например: /pretty 4")
-        return
-    start_pretty(m.chat.id, n)
+    if 3 <= n <= 6:
+        start_pretty(m.chat.id, n)
 
 
 @bot.message_handler(commands=["variants"])
@@ -776,12 +776,10 @@ def cmd_variants(m):
     if not guard(m):
         return
     parts = m.text.split()
-    if len(parts) < 2 or not re.fullmatch(r"[A-Za-z0-9]{2,16}", parts[1]):
-        tg(bot.reply_to, m, "Пример: /variants shadow")
-        return
-    word = parts[1].lower()
-    names = variant_names(word)
-    begin(m.chat.id, new_spec("variants", f"Варианты слова «{word}»", len(names), word=word))
+    if len(parts) >= 2:
+        word = parts[1].lower()
+        names = variant_names(word)
+        begin(m.chat.id, new_spec("variants", f"Варианты «{word}»", len(names), word=word))
 
 
 @bot.message_handler(commands=["scan"])
@@ -789,14 +787,11 @@ def cmd_scan(m):
     if not guard(m):
         return
     args = m.text.split()[1:]
-    if not args:
-        tg(bot.reply_to, m, "Пример: /scan ???? 300")
-        return
-    pattern = args[0].lower()
-    n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
-    full = math.prod(len(o) for o in pattern_options(pattern))
-    total = n or full
-    begin(m.chat.id, new_spec("scan", f"Шаблон {pattern}", total, pattern=pattern, n=n, seed=random.randrange(2**31)))
+    if args:
+        pattern = args[0].lower()
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
+        full = math.prod(len(o) for o in pattern_options(pattern))
+        begin(m.chat.id, new_spec("scan", f"Шаблон {pattern}", n or full, pattern=pattern, n=n, seed=random.randrange(2**31)))
 
 
 @bot.message_handler(content_types=["document"])
@@ -804,33 +799,29 @@ def on_document(m):
     if not guard(m):
         return
     doc = m.document
-    if not (doc.file_name or "").lower().endswith(".txt"):
-        tg(bot.reply_to, m, "Нужен .txt файл")
-        return
-    data = tg(lambda: bot.download_file(bot.get_file(doc.file_id).file_path))
-    if data is None:
-        return
-    names = list(dict.fromkeys(x.strip().lower() for x in data.decode("utf-8", "ignore").splitlines() if x.strip()))[:MAX_WORDS]
-    if names:
-        begin(m.chat.id, new_spec("words", f"Файл {doc.file_name}", len(names), words=names))
+    if (doc.file_name or "").lower().endswith(".txt"):
+        data = tg(lambda: bot.download_file(bot.get_file(doc.file_id).file_path))
+        if data:
+            names = list(dict.fromkeys(x.strip().lower() for x in data.decode("utf-8", "ignore").splitlines() if x.strip()))[:MAX_WORDS]
+            if names:
+                begin(m.chat.id, new_spec("words", f"Файл {doc.file_name}", len(names), words=names))
 
 
 def quick_check(chat_id, names):
     session = requests.Session()
-    session.headers["User-Agent"] = "Mozilla/5.0 (username-checker)"
     never = threading.Event()
     lines = []
     for name in names:
         if not valid_format(name):
-            lines.append(f"⚪ <code>{html.escape(name)}</code> — неверный формат")
+            lines.append(f"⚪ <code>{name}</code> — неверный формат")
             continue
         st = check(session, name, never)
         lines.append({
             "free": f"🟢 <code>{name}</code> — свободен",
             "taken": f"🔴 <code>{name}</code> — занят",
-            "blocked": f"⛔ <code>{name}</code> — запрещён Roblox",
-        }.get(st, f"⚠️ <code>{name}</code> — ошибка проверки"))
-        time.sleep(0.2)
+            "blocked": f"⛔ <code>{name}</code> — запрещен",
+        }.get(st, f"⚠️ <code>{name}</code> — ошибка"))
+        time.sleep(0.1)
     say(chat_id, "\n".join(lines))
 
 
@@ -855,10 +846,8 @@ def cmd_status(m):
 @bot.message_handler(commands=["stop"])
 def cmd_stop(m):
     if guard(m):
-        if stop_job(m.chat.id):
-            tg(bot.reply_to, m, "Останавливаю...")
-        else:
-            tg(bot.reply_to, m, "Нечего останавливать")
+        stop_job(m.chat.id)
+        tg(bot.reply_to, m, "Останавливаю...")
 
 
 @bot.message_handler(commands=["resume"])
@@ -872,19 +861,7 @@ def found_text():
         names = list(state["found"])
     if not names:
         return "Пока ничего не найдено"
-    shown = names[-50:]
-    return f"Найдено свободных: {len(names)} (последние {len(shown)}):\n" + "\n".join(f"<code>{x}</code>" for x in shown)
-
-
-def send_export(chat_id):
-    with state_lock:
-        names = list(state["found"])
-    if not names:
-        say(chat_id, "Пока ничего не найдено")
-        return
-    bio = io.BytesIO("\n".join(names).encode("utf-8"))
-    bio.name = "found.txt"
-    tg(bot.send_document, chat_id, bio)
+    return f"Найдено свободных: {len(names)}:\n" + "\n".join(f"<code>{x}</code>" for x in names[-50:])
 
 
 @bot.message_handler(commands=["found"])
@@ -896,7 +873,12 @@ def cmd_found(m):
 @bot.message_handler(commands=["export"])
 def cmd_export(m):
     if guard(m):
-        send_export(m.chat.id)
+        with state_lock:
+            names = list(state["found"])
+        if names:
+            bio = io.BytesIO("\n".join(names).encode("utf-8"))
+            bio.name = "found.txt"
+            tg(bot.send_document, m.chat.id, bio)
 
 
 def set_delay(value):
@@ -912,13 +894,11 @@ def cmd_delay(m):
     if not guard(m):
         return
     parts = m.text.split()
-    if len(parts) < 2:
-        say(m.chat.id, settings_text(), settings_markup())
-        return
-    try:
-        set_delay(float(parts[1].replace(",", ".")))
-    except ValueError:
-        pass
+    if len(parts) >= 2:
+        try:
+            set_delay(float(parts[1].replace(",", ".")))
+        except ValueError:
+            pass
     say(m.chat.id, settings_text(), settings_markup())
 
 
@@ -929,7 +909,7 @@ def on_text(m):
         if tokens and all(re.fullmatch(r"[A-Za-z0-9_]+", t) for t in tokens):
             start_quick(m.chat.id, tokens)
         else:
-            say(m.chat.id, "Напиши ник для проверки или открой /menu")
+            say(m.chat.id, "Используй /menu или напиши ник")
 
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -940,21 +920,19 @@ def on_callback(c):
         return
     data = c.data or ""
     if data == "stop":
-        ok = stop_job(chat_id)
-        tg(bot.answer_callback_query, c.id, "Останавливаю..." if ok else "Нечего останавливать")
+        stop_job(chat_id)
+        tg(bot.answer_callback_query, c.id, "Останавливаю...")
     elif data == "refresh":
         job = jobs.get(chat_id)
         if job and job["panel"]:
             job["panel"].update(force=True)
             tg(bot.answer_callback_query, c.id, "Обновлено")
-        else:
-            tg(bot.answer_callback_query, c.id, "Нет активной проверки")
     elif data.startswith("re:"):
         tg(bot.answer_callback_query, c.id, "Проверяю...")
         start_quick(chat_id, [data[3:]])
     elif data in ("dl:+", "dl:-"):
-        set_delay(DELAY + (0.3 if data == "dl:+" else -0.3))
-        tg(bot.answer_callback_query, c.id, f"Пауза {DELAY:.1f} с")
+        set_delay(DELAY + (0.1 if data == "dl:+" else -0.1))
+        tg(bot.answer_callback_query, c.id, f"Пауза {DELAY:.2f}с")
         tg(bot.edit_message_text, settings_text(), chat_id=chat_id, message_id=c.message.message_id,
            parse_mode="HTML", reply_markup=settings_markup())
     elif data.startswith("m:"):
@@ -974,47 +952,35 @@ def on_callback(c):
             send_export(chat_id)
         elif action == "set":
             say(chat_id, settings_text(), settings_markup())
-    else:
-        tg(bot.answer_callback_query, c.id)
 
-
-# ============================ сервер ping ============================
 
 class PingHandler(BaseHTTPRequestHandler):
-    def _ok(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-
     def do_GET(self):
-        self._ok()
+        self.send_response(200)
+        self.end_headers()
         self.wfile.write(b"ok")
-
     def do_HEAD(self):
-        self._ok()
-
+        self.send_response(200)
+        self.end_headers()
     def log_message(self, *args):
         pass
 
 
 def start_ping_server():
     port = os.environ.get("PORT")
-    if not port:
-        return
-    server = ThreadingHTTPServer(("0.0.0.0", int(port)), PingHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log.info("Ping-сервер на порту %s", port)
+    if port:
+        server = ThreadingHTTPServer(("0.0.0.0", int(port)), PingHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 def shutdown(signum=None, frame=None):
     if SHUTTING_DOWN.is_set():
         return
     SHUTTING_DOWN.set()
-    log.info("Остановка бота...")
     for job in list(jobs.values()):
         job["stop"].set()
     persist(force=True)
-    time.sleep(2)
+    time.sleep(1)
     os._exit(0)
 
 
@@ -1023,13 +989,13 @@ def main():
     try:
         me = bot.get_me()
     except Exception as e:
-        raise SystemExit(f"Ошибка подключения к Telegram: {e}")
+        raise SystemExit(f"Ошибка Telegram: {e}")
     log.info("Бот запущен: @%s", me.username)
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     resume_saved_jobs()
     try:
-        bot.infinity_polling(skip_pending=True)
+        bot.infinity_polling(skip_pending=True, interval=0.5, timeout=20)
     except KeyboardInterrupt:
         shutdown()
 
