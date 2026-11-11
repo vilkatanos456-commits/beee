@@ -1056,13 +1056,18 @@ def shutdown(signum=None, frame=None):
 def main():
     start_ping_server()
     try:
+        # Сбрасываем старые зависшие вебхуки и обновления перед стартом
+        bot.delete_webhook(drop_pending_updates=True)
+        time.sleep(1)
         me = bot.get_me()
     except Exception as e:
         raise SystemExit(f"Ошибка Telegram: {e}")
+        
     log.info("Бот запущен: @%s", me.username)
     signal.signal(signal.SIGTERM, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     resume_saved_jobs()
+    
     try:
         bot.infinity_polling(skip_pending=True, interval=0.5, timeout=20)
     except KeyboardInterrupt:
