@@ -460,9 +460,9 @@ def pattern_options(pattern):
         elif ch == "#":
             opts.append(DIGITS)
         elif ch == "_":
-            opts.append("_")
+            opts.append(["_"])  # Важно: оборачиваем в список, чтобы генератор мог выбрать его как символ
         else:
-            opts.append(ch)
+            opts.append([ch])
     return opts
 
 
