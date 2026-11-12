@@ -318,17 +318,50 @@ def make_names(spec):
 
 # ============================ ОЦЕНКА НИКОВ ============================
 
-WORDS = {
+# Базовый топ популярных OG-слов (максимальный бонус)
+OG_WORDS = {
     "fire", "ice", "dark", "light", "king", "queen", "wolf", "fox", "star", "moon", "sun", "storm",
     "night", "ghost", "angel", "devil", "dragon", "shadow", "blade", "ninja", "hero", "zero", "neo",
     "nova", "luna", "echo", "frost", "flame", "venom", "viper", "raven", "hawk", "tiger", "lion",
     "bear", "wild", "cool", "epic", "rich", "gold", "silver", "iron", "steel", "stone", "rock",
     "wind", "rain", "snow", "sky", "sea", "wave", "ash", "onyx", "ruby", "jade", "zen", "ace",
+    "void", "abyss", "chaos", "omega", "alpha", "titan", "atlas", "zeus", "ares", "hades", "odin",
+    "thor", "loki", "vale", "dawn", "dusk", "mist", "haze", "spark", "volt", "flux", "nexus", "apex",
     "max", "rex", "kai", "leo", "ivy", "eli", "ray", "sam", "alex", "jack", "john", "mike", "anna",
 }
+
+def _load_dict():
+    """Загружает расширенный словарь английских слов (если есть файл words.txt или скачивает 1 раз)."""
+    dict_path = "words_en.txt"
+    if not os.path.exists(dict_path):
+        try:
+            r = requests.get(
+                "https://raw.githubusercontent.com/dwyl/english-words/master/words_alpha.txt",
+                timeout=10
+            )
+            if r.status_code == 200:
+                words = [w.strip().lower() for w in r.text.splitlines() if 3 <= len(w.strip()) <= 12 and w.strip().isalpha()]
+                with open(dict_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(words))
+        except Exception as e:
+            log.warning("Не удалось скачать словарь: %s", e)
+            return set(OG_WORDS)
+
+    try:
+        with open(dict_path, encoding="utf-8") as f:
+            return {line.strip().lower() for line in f if line.strip()} | OG_WORDS
+    except Exception:
+        return set(OG_WORDS)
+
+
+ALL_WORDS = _load_dict()
 VOWELS = "aeiouy"
-LEN_POINTS = {3: 25, 4: 22, 5: 18, 6: 14, 7: 9, 8: 9}
+LEN_POINTS = {3: 30, 4: 26, 5: 22, 6: 17, 7: 11, 8: 9, 9: 7}
 CONFUSABLE = ("il", "li", "ll", "rn", "1l", "l1", "o0", "0o", "iii", "lll")
+
+# Красивые фэнтези/латинские сочетания и редкие согласные
+AESTHETIC_DIGRAPHS = ("ae", "yl", "th", "ix", "ex", "ox", "ax", "yn", "ys", "yr", "eo", "ia", "va", "zy", "vy")
+RARE_LETTERS = set("vxzqky")
 
 
 def _pronounceable(s):
@@ -347,12 +380,20 @@ def _pronounceable(s):
     return True
 
 
+def _is_cvcvc(s):
+    """Проверяет идеальное чередование согласная-гласная (типа K-a-v-o-n)."""
+    if len(s) not in (4, 5, 6) or not s.isalpha():
+        return False
+    pattern = ["V" if c in VOWELS else "C" for c in s]
+    return all(pattern[i] != pattern[i + 1] for i in range(len(pattern) - 1))
+
+
 def _pattern_points(n):
     L = len(n)
     if L < 3:
         return 0, ""
     if len(set(n)) == 1:
-        return 20, "повтор"
+        return 22, "повтор"
     diffs = {ord(n[i + 1]) - ord(n[i]) for i in range(L - 1)}
     if n.isalpha() and diffs in ({1}, {-1}):
         return 20, "алфавитный ряд"
@@ -360,11 +401,13 @@ def _pattern_points(n):
         if n in row or n[::-1] in row:
             return 20, "ряд клавиатуры"
     if len(set(n)) == 2 and L >= 4 and all(n[i] == n[i % 2] for i in range(L)):
-        return 16, "чередование"
+        return 18, "чередование"
     if n == n[::-1]:
-        return 16, "палиндром"
+        return 18, "палиндром"
     if L % 2 == 0 and n[:L // 2] == n[L // 2:]:
-        return 14, "двойной повтор"
+        return 15, "двойной повтор"
+    if _is_cvcvc(n):
+        return 10, "CVCVC-ритм"
     return 0, ""
 
 
@@ -376,45 +419,54 @@ def rate_name(name):
 
     length = LEN_POINTS.get(L, 4)
 
-    if core and core in WORDS:
-        meaning = 25
+    # 1. Смысл / словарность
+    if core in OG_WORDS:
+        meaning = 30
+    elif core in ALL_WORDS:
+        meaning = 24  # Настоящее редкое слово (как caelostat)
     elif _pronounceable(core):
-        meaning = 15
+        meaning = 14
     else:
-        meaning = 5
+        meaning = 4
 
+    # 2. Паттерны и ритм
     pattern, pattern_name = _pattern_points(n)
 
+    # 3. Чистота символов
     if "_" in n:
-        chars = 5
+        chars = 4
     elif any(c.isdigit() for c in n):
         digit_inside = bool(re.search(r"[a-z][0-9]+[a-z]", n))
-        chars = 3 if digit_inside else 8
+        chars = 2 if digit_inside else 7
     else:
         chars = 15
 
-    if _pronounceable(core) and L <= 8:
-        sound = 15
-    elif _pronounceable(core):
-        sound = 8
+    # 4. Звучание и эстетика (бонус за редкие буквы и фэнтези-сочетания)
+    sound = 0
+    if _pronounceable(core):
+        sound += 10 if L <= 7 else 6
+        digraph_hits = sum(1 for d in AESTHETIC_DIGRAPHS if d in core)
+        rare_hits = sum(1 for c in set(core) if c in RARE_LETTERS)
+        sound += min(7, digraph_hits * 3 + rare_hits * 2)
     else:
-        sound = 3
+        sound = 2
 
+    # 5. Штрафы
     penalty = 0
     if any(p in n for p in CONFUSABLE):
         penalty += 5
     if re.search(r"(.)\1\1", n) and len(set(n)) > 1:
-        penalty += 3
-    if L >= 9 and meaning < 25:
-        penalty += 2
+        penalty += 4
+    if L >= 9 and meaning < 24:
+        penalty += 4
 
     score = max(0, min(100, length + meaning + pattern + chars + sound - penalty))
 
-    if score >= 90:
+    if score >= 88:
         grade, rarity = "S", "💎 Очень редкий"
-    elif score >= 75:
+    elif score >= 72:
         grade, rarity = "A", "🔥 Редкий"
-    elif score >= 60:
+    elif score >= 58:
         grade, rarity = "B", "✨ Необычный"
     elif score >= 40:
         grade, rarity = "C", "🙂 Обычный"
