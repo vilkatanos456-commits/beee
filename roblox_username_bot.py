@@ -129,6 +129,7 @@ class Storage:
 
     def load(self):
         data = {}
+        raw = None
         try:
             if self.redis is not None:
                 raw = self.redis.get(REDIS_KEY)
@@ -302,24 +303,6 @@ def variant_names(word):
     return [x for x in dict.fromkeys(out) if valid_format(x)][:3000]
 
 
-def make_names(spec):
-    kind, pos = spec["kind"], spec.get("pos", 0)
-    if kind == "all":
-        return gen_all(spec["length"], pos)
-    if kind == "scan":
-        return itertools.islice(
-            gen_pattern(pattern_options(spec["pattern"]), spec["n"], spec["seed"]), pos, None)
-    if kind == "pretty":
-        return iter(pretty_names(spec["length"])[pos:])
-    if kind == "variants":
-        return iter(variant_names(spec["word"])[pos:])
-    if kind == "words":
-        return iter(spec["words"][pos:])
-    if kind == "cvcv":
-        return iter(cvcv_names()[pos:])
-    raise ValueError(f"Неизвестный тип задачи: {kind}")
-
-
 def cvcv_names():
     """Все 4-буквенные комбинации CVCV и VCVC (согласная+гласная чередованием)."""
     cons = [c for c in LETTERS if c not in VOWELS]
@@ -336,9 +319,68 @@ def cvcv_names():
     return [x for x in dict.fromkeys(out) if valid_format(x)]
 
 
+def patterns_20l():
+    """Генерирует идеальные математические паттерны длиной ровно 20 символов."""
+    alphabet = LETTERS + DIGITS
+    out = []
+
+    # 1. 20 одинаковых символов (aaaaaaaaaaaaaaaaaaaa, 11111111111111111111)
+    for ch in alphabet:
+        out.append(ch * 20)
+
+    # 2. Строгое чередование ABABAB... (xoxoxoxoxoxoxoxoxoxo, 10101010101010101010)
+    for a in alphabet:
+        for b in alphabet:
+            if a != b:
+                out.append((a + b) * 10)
+
+    # 3. Парные блоки AABBAABB... (xxyyxxyyxxyyxxyyxxyy)
+    for a in LETTERS:
+        for b in LETTERS:
+            if a != b:
+                out.append((a * 2 + b * 2) * 5)
+
+    # 4. Зеркальные половины (10 одинаковых + 10 одинаковых)
+    for a in LETTERS:
+        for b in LETTERS:
+            if a != b:
+                out.append(a * 10 + b * 10)
+
+    # 5. Красивые 4-буквенные корни × 5 раз (kurokurokurokurokuro)
+    for root in cvcv_names()[:150]:
+        out.append(root * 5)
+
+    # 6. Популярные 5-буквенные слова/ряды × 4 раза
+    roots5 = ["qwert", "asdfg", "zxcvb", "shadow"[:5], "ghost", "night", "frost", "flame",
+              "venom", "viper", "raven", "tiger", "chaos", "omega", "alpha", "titan", "nexus"]
+    for root in roots5:
+        out.append(root * 4)
+
+    return [x for x in dict.fromkeys(out) if len(x) == 20 and valid_format(x)]
+
+
+def make_names(spec):
+    kind, pos = spec["kind"], spec.get("pos", 0)
+    if kind == "all":
+        return gen_all(spec["length"], pos)
+    if kind == "scan":
+        return itertools.islice(
+            gen_pattern(pattern_options(spec["pattern"]), spec["n"], spec["seed"]), pos, None)
+    if kind == "pretty":
+        return iter(pretty_names(spec["length"])[pos:])
+    if kind == "variants":
+        return iter(variant_names(spec["word"])[pos:])
+    if kind == "words":
+        return iter(spec["words"][pos:])
+    if kind == "cvcv":
+        return iter(cvcv_names()[pos:])
+    if kind == "p20":
+        return iter(patterns_20l()[pos:])
+    raise ValueError(f"Неизвестный тип задачи: {kind}")
+
+
 # ============================ ОЦЕНКА НИКОВ ============================
 
-# Базовый топ популярных OG-слов (максимальный бонус)
 OG_WORDS = {
     "fire", "ice", "dark", "light", "king", "queen", "wolf", "fox", "star", "moon", "sun", "storm",
     "night", "ghost", "angel", "devil", "dragon", "shadow", "blade", "ninja", "hero", "zero", "neo",
@@ -352,7 +394,7 @@ OG_WORDS = {
 
 
 def _load_dict():
-    """Загружает расширенный словарь английских слов (если есть файл words.txt или скачивает 1 раз)."""
+    """Загружает расширенный словарь английских слов (если есть файл words_en.txt или скачивает 1 раз)."""
     dict_path = "words_en.txt"
     if not os.path.exists(dict_path):
         try:
@@ -436,7 +478,7 @@ def rate_name(name):
     elif _pronounceable(core):
         meaning = 8   # Просто выдуманное слово
     else:
-        meaning = 0   # Каша из согласных (типа hodukq)
+        meaning = 0   # Каша из согласных
 
     # 2. Строгие паттерны (только повторы, палиндромы, ряды)
     pattern, pattern_name = _pattern_points(n)
@@ -456,6 +498,10 @@ def rate_name(name):
         penalty += 5
     if re.search(r"(.)\1\1", n) and len(set(n)) > 1:
         penalty += 5
+
+    # Бонус для идеальных 20L-паттернов
+    if L == 20 and pattern >= 16:
+        length = 45
 
     score = max(0, min(100, length + meaning + pattern + chars - penalty))
 
@@ -481,12 +527,13 @@ def rating_line(name):
 
 def rating_report(name):
     r = rate_name(name)
-    ln, me, pa, ch, so, pen = r["parts"]
+    ln, me, pa, ch, _, pen = r["parts"]
     pat = f" ({r['pattern']})" if r["pattern"] else ""
     return (f"<code>{html.escape(name)}</code> — {r['rarity']}\n"
             f"Оценка: <b>{r['grade']}</b> · {r['score']}/100\n"
-            f"Длина {ln}/30 · Смысл {me}/30 · Паттерн {pa}/22{pat}\n"
-            f"Символы {ch}/15 · Звучание {so}/17 · Штраф −{pen}")
+            f"Длина {ln}/45 · Словарь {me}/40 · Паттерн {pa}/25{pat}\n"
+            f"Символы {ch}/15 · Штраф −{pen}")
+
 
 # ============================ ИИ ГЕНЕРАТОР (GOOGLE GENAI) ============================
 
@@ -527,21 +574,21 @@ def pick_models():
 def _mark_bad(model_name, err):
     msg = str(err)
     if "404" in msg or "NOT_FOUND" in msg:
-        _bad_until[model_name] = float("inf")  # модель не существует для ключа
+        _bad_until[model_name] = float("inf")
     elif any(x in msg for x in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
-        _bad_until[model_name] = time.time() + 120  # перегружена, пропускаем 2 минуты
+        _bad_until[model_name] = time.time() + 120
 
 
 def run_ai_search(chat_id, topic, count):
     ai_last_queries[chat_id] = (topic, count)
-    say(chat_id, f"🧠 Gemini генерирует до {count} ников по теме: <b>{html.escape(topic)}</b>...")
+    say(chat_id, f"🧠 Gemini генерирует до {count} редких слов по теме: <b>{html.escape(topic)}</b>...")
 
     def process_ai():
         names, err = generate_ai_names(topic, count)
         if not names:
             say(chat_id, f"❌ Gemini не ответил.\n<code>{html.escape(err or '')}</code>")
             return
-        say(chat_id, f"✅ ИИ сгенерировал {len(names)} ников. Запускаю проверку...")
+        say(chat_id, f"✅ ИИ подобрал {len(names)} слов. Запускаю проверку...")
         begin(chat_id,
               new_spec("words", f"ИИ (Gemini): {topic}", len(names), words=names, ai_topic=topic, ai_count=count))
 
@@ -563,22 +610,22 @@ def generate_ai_names(prompt_topic, count=AI_DEFAULT):
         rounds += 1
         want = min(AI_BATCH, count - len(names) + 40)
         avoid = ", ".join(names[-40:])
+        avoid_rule = f"\n6. AVOID DUPLICATES: Do NOT include any of these: {avoid}" if avoid else ""
         prompt = (
-            f"You are a master gaming username designer.\n"
-            f"Take the theme: '{prompt_topic}' and transform it into {count} rare, clean usernames.\n\n"
-            f"STRICT RULES FOR GENERATION:\n"
-            f"1. THEMATIC VARIATIONS: Derive unique roots, Latin/Greek stems, and stylistic variations from the concept '{prompt_topic}'.\n"
-            f"2. TARGET LENGTHS: Strictly output names from 4 to 10 letters long (balanced mix of 4, 5, 6, 7, 8, 9, and 10 letters).\n"
-            f"3. CLEAN ONLY: Only Latin letters (A-Z). ABSOLUTELY NO numbers, NO underscores, NO trash like 'xX', 'pro', 'yt', '123'.\n"
-            f"4. PHONETICS: Must sound premium and pronounceable (e.g., theme 'shadow' -> 'gloom', 'umbra', 'nyxian', 'gloomix', 'shadowed').\n"
-            f"5. OUTPUT FORMAT: Return ONLY raw usernames separated by spaces or newlines. No numbers, no markdown, no bullets."
+            f"You are an expert lexicographer and rare username hunter.\n"
+            f"Theme/concept: '{prompt_topic}'. Generate {want} real, rare English dictionary words related to this theme.\n\n"
+            f"STRICT RULES:\n"
+            f"1. REAL DICTIONARY WORDS ONLY: Output ONLY genuine, existing English words (nouns, adjectives, archaic, scientific, astronomical, chemical, botanical, or medical terms). DO NOT invent fake fantasy words.\n"
+            f"2. SHORT LENGTH: Strictly 5 or 6 letters long (a few 4 or 7 letter rare terms are acceptable, but prioritize 5–6 letters).\n"
+            f"3. CLEAN LETTERS ONLY: Only Latin letters (A-Z). No numbers, no underscores, no prefixes/suffixes.\n"
+            f"4. OUTPUT FORMAT: Return ONLY raw lowercase words separated by spaces or newlines. No numbering, no bullets, no explanations.{avoid_rule}"
         )
         got = False
         for model_name in pick_models():
             try:
                 resp = ai_client.models.generate_content(
                     model=model_name, contents=prompt, config=config)
-                words = re.findall(r"[A-Za-z0-9_]{3,15}", resp.text or "")
+                words = re.findall(r"[A-Za-z0-9_]{3,20}", resp.text or "")
                 fresh = [w.lower() for w in words if valid_format(w.lower())]
                 before = len(names)
                 names = list(dict.fromkeys(names + fresh))
@@ -712,9 +759,10 @@ def button(text, data=None, url=None):
 
 def main_menu():
     kb = types.InlineKeyboardMarkup()
-    kb.row(button("💎 Все CVCV (4 буквы)", "m:cvcv"), button("🔍 Все 4 буквы", "m:all4"))
-    kb.row(button("🔍 Все 5 букв", "m:all5"), button("✨ Красивые 4", "m:pr4"))
-    kb.row(button("📊 Статус", "m:status"), button("⏹ Стоп", "stop"), button("▶️ Продолжить", "m:resume"))
+    kb.row(button("💎 Все CVCV (4 буквы)", "m:cvcv"), button("🔁 Паттерны 20L", "m:p20"))
+    kb.row(button("🔍 Все 4 буквы", "m:all4"), button("🔍 Все 5 букв", "m:all5"))
+    kb.row(button("✨ Красивые 4", "m:pr4"), button("📊 Статус", "m:status"))
+    kb.row(button("⏹ Стоп", "stop"), button("▶️ Продолжить", "m:resume"))
     kb.row(button("📋 Найденные", "m:found"), button("📤 Экспорт", "m:export"), button("⚙️ Настройки", "m:set"))
     return kb
 
@@ -723,8 +771,7 @@ def settings_text():
     with _delay_lock:
         d = DELAY
     ms = state.get("min_notify_score", 60)
-    grade_lbl = {0: "Все (D+)", 40: "Обычные (C+)", 60: "Необычные (B+)", 75: "Редкие (A+)", 90: "Только S"}.get(ms,
-                                                                                                                 f"от {ms}")
+    grade_lbl = {0: "Все (D+)", 38: "Обычные (C+)", 55: "Необычные (B+)", 70: "Редкие (A+)", 85: "Только S"}.get(ms, f"от {ms}")
     return (f"⚙️ <b>Настройки бота</b>\n\n"
             f"⏱ Пауза: <b>{d:.2f} с</b> (потоков: {MAX_THREADS})\n"
             f"🔔 Уведомлять о никах: <b>{grade_lbl}</b> (≥ {ms} баллов)\n"
@@ -736,9 +783,9 @@ def settings_markup():
     kb.row(button("➖ 0.1 с", "dl:-"), button("➕ 0.1 с", "dl:+"))
     kb.row(
         button("Все (0)", "nt:0"),
-        button("C+ (40)", "nt:40"),
-        button("B+ (60)", "nt:60"),
-        button("A+ (75)", "nt:75"),
+        button("C+ (38)", "nt:38"),
+        button("B+ (55)", "nt:55"),
+        button("A+ (70)", "nt:70"),
     )
     return kb
 
@@ -832,7 +879,7 @@ def announce(chat_id, name):
 def run_job(chat_id, job):
     spec = job["spec"]
     stats = spec["stats"]
-    is_file_or_custom = spec["kind"] in ("words", "variants", "pretty", "scan")
+    is_file_or_custom = spec["kind"] in ("words", "variants", "pretty", "scan", "p20")
     panel = Panel(chat_id, job)
     job["panel"] = panel
     panel.send()
@@ -1052,11 +1099,11 @@ def guard(m):
 
 
 HELP = (
-    "<b>Бот для поиска ников в Roblox (ИИ версия Gemini)</b>\n\n"
+    "<b>Бот для поиска редких ников в Roblox</b>\n\n"
     "/menu — главное меню\n"
-    f"<code>/ai [число] [тема]</code> — сгенерировать через Gemini и проверить "
-    f"(по умолчанию {AI_DEFAULT}, максимум {AI_MAX}). Пример: <code>/ai 1000 dark fantasy</code>\n"
-    "<code>/rate ник</code> — оценить ник (грейд и редкость)\n"
+    f"<code>/ai [число] [тема]</code> — подобрать редкие словарные слова через Gemini и проверить "
+    f"(по умолчанию {AI_DEFAULT}, максимум {AI_MAX}). Пример: <code>/ai 500 astronomy</code>\n"
+    "<code>/rate ник</code> — оценить реальную редкость ника\n"
     "<code>/name ник</code> — быстрая проверка ников\n"
     "/all4 /all5 — поиск по всем комбинациям\n"
     "/pretty 4 — красивый перебор\n"
@@ -1064,7 +1111,7 @@ HELP = (
     "<code>/scan шаблон [кол-во]</code> — поиск по шаблону (? буква, # цифра)\n"
     "/status /stop /resume — управление задачами\n"
     "/found — список найденных, /export — файл\n"
-    "/delay — пауза между пачками"
+    "/delay /notify — настройки скорости и уведомлений"
 )
 
 
@@ -1100,7 +1147,7 @@ def cmd_ai(m):
     if first.isdigit():
         count = min(max(int(first), 10), AI_MAX)
         rest = tail.strip()
-    topic = rest or "cyberpunk aesthetic"
+    topic = rest or "rare scientific and astronomical terms"
     run_ai_search(m.chat.id, topic, count)
 
 
@@ -1347,6 +1394,9 @@ def on_callback(c):
         elif action == "cvcv":
             names = cvcv_names()
             begin(chat_id, new_spec("cvcv", "Все 4 буквы CVCV/VCVC", len(names)))
+        elif action == "p20":
+            names = patterns_20l()
+            begin(chat_id, new_spec("p20", "Паттерны 20 символов (20L)", len(names)))
         elif action == "status":
             send_status(chat_id)
         elif action == "resume":
@@ -1394,7 +1444,6 @@ def shutdown(signum=None, frame=None):
 def main():
     start_ping_server()
     try:
-        # Сброс старых подключений, чтобы избежать ошибки 409 Conflict
         bot.delete_webhook(drop_pending_updates=True)
         time.sleep(1)
         me = bot.get_me()
