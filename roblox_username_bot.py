@@ -159,6 +159,8 @@ storage = Storage()
 state = storage.load()
 state.setdefault("jobs", {})
 state.setdefault("found", [])
+state.setdefault("min_notify_score", 60)
+ai_last_queries = {}  # chat_id -> (topic, count)
 try:
     DELAY = min(max(float(state.get("delay", DELAY)), MIN_DELAY), MAX_DELAY)
 except (TypeError, ValueError):
@@ -313,7 +315,25 @@ def make_names(spec):
         return iter(variant_names(spec["word"])[pos:])
     if kind == "words":
         return iter(spec["words"][pos:])
+    if kind == "cvcv":
+        return iter(cvcv_names()[pos:])
     raise ValueError(f"Неизвестный тип задачи: {kind}")
+
+
+def cvcv_names():
+    """Все 4-буквенные комбинации CVCV и VCVC (согласная+гласная чередованием)."""
+    cons = [c for c in LETTERS if c not in VOWELS]
+    vows = list(VOWELS)
+    out = []
+    # CVCV (например, kuro, vexa)
+    for c1, v1, c2, v2 in itertools.product(cons, vows, cons, vows):
+        out.append(c1 + v1 + c2 + v2)
+    # VCVC (например, alex, orin)
+    for v1, c1, v2, c2 in itertools.product(vows, cons, vows, cons):
+        out.append(v1 + c1 + v2 + c2)
+    rng = random.Random(42)
+    rng.shuffle(out)
+    return [x for x in dict.fromkeys(out) if valid_format(x)]
 
 
 # ============================ ОЦЕНКА НИКОВ ============================
@@ -330,6 +350,7 @@ OG_WORDS = {
     "max", "rex", "kai", "leo", "ivy", "eli", "ray", "sam", "alex", "jack", "john", "mike", "anna",
 }
 
+
 def _load_dict():
     """Загружает расширенный словарь английских слов (если есть файл words.txt или скачивает 1 раз)."""
     dict_path = "words_en.txt"
@@ -340,7 +361,8 @@ def _load_dict():
                 timeout=10
             )
             if r.status_code == 200:
-                words = [w.strip().lower() for w in r.text.splitlines() if 3 <= len(w.strip()) <= 12 and w.strip().isalpha()]
+                words = [w.strip().lower() for w in r.text.splitlines() if
+                         3 <= len(w.strip()) <= 12 and w.strip().isalpha()]
                 with open(dict_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(words))
         except Exception as e:
@@ -488,16 +510,15 @@ def rating_report(name):
     pat = f" ({r['pattern']})" if r["pattern"] else ""
     return (f"<code>{html.escape(name)}</code> — {r['rarity']}\n"
             f"Оценка: <b>{r['grade']}</b> · {r['score']}/100\n"
-            f"Длина {ln}/25 · Смысл {me}/25 · Паттерн {pa}/20{pat}\n"
-            f"Символы {ch}/15 · Звучание {so}/15 · Штраф −{pen}")
-
+            f"Длина {ln}/30 · Смысл {me}/30 · Паттерн {pa}/22{pat}\n"
+            f"Символы {ch}/15 · Звучание {so}/17 · Штраф −{pen}")
 
 # ============================ ИИ ГЕНЕРАТОР (GOOGLE GENAI) ============================
 
 PREFERRED_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
 _models_cache = []
-_bad_until = {}      # модель -> время, до которого её пропускаем
-_good_model = None   # последняя модель, которая ответила
+_bad_until = {}  # модель -> время, до которого её пропускаем
+_good_model = None  # последняя модель, которая ответила
 
 
 def pick_models():
@@ -531,9 +552,25 @@ def pick_models():
 def _mark_bad(model_name, err):
     msg = str(err)
     if "404" in msg or "NOT_FOUND" in msg:
-        _bad_until[model_name] = float("inf")      # модель не существует для ключа
+        _bad_until[model_name] = float("inf")  # модель не существует для ключа
     elif any(x in msg for x in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
         _bad_until[model_name] = time.time() + 120  # перегружена, пропускаем 2 минуты
+
+
+def run_ai_search(chat_id, topic, count):
+    ai_last_queries[chat_id] = (topic, count)
+    say(chat_id, f"🧠 Gemini генерирует до {count} ников по теме: <b>{html.escape(topic)}</b>...")
+
+    def process_ai():
+        names, err = generate_ai_names(topic, count)
+        if not names:
+            say(chat_id, f"❌ Gemini не ответил.\n<code>{html.escape(err or '')}</code>")
+            return
+        say(chat_id, f"✅ ИИ сгенерировал {len(names)} ников. Запускаю проверку...")
+        begin(chat_id,
+              new_spec("words", f"ИИ (Gemini): {topic}", len(names), words=names, ai_topic=topic, ai_count=count))
+
+    threading.Thread(target=process_ai, daemon=True).start()
 
 
 def generate_ai_names(prompt_topic, count=AI_DEFAULT):
@@ -700,29 +737,40 @@ def button(text, data=None, url=None):
 
 def main_menu():
     kb = types.InlineKeyboardMarkup()
-    kb.row(button("🔍 Все 4 буквы", "m:all4"), button("🔍 Все 5 букв", "m:all5"))
-    kb.row(button("✨ Красивые 4", "m:pr4"), button("✨ Красивые 5", "m:pr5"))
+    kb.row(button("💎 Все CVCV (4 буквы)", "m:cvcv"), button("🔍 Все 4 буквы", "m:all4"))
+    kb.row(button("🔍 Все 5 букв", "m:all5"), button("✨ Красивые 4", "m:pr4"))
     kb.row(button("📊 Статус", "m:status"), button("⏹ Стоп", "stop"), button("▶️ Продолжить", "m:resume"))
-    kb.row(button("📋 Найденные", "m:found"), button("📤 Экспорт", "m:export"), button("⚙️ Пауза", "m:set"))
-    return kb
-
-
-def panel_markup():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(button("⏹ Стоп", "stop"), button("🔄 Обновить", "refresh"))
+    kb.row(button("📋 Найденные", "m:found"), button("📤 Экспорт", "m:export"), button("⚙️ Настройки", "m:set"))
     return kb
 
 
 def settings_text():
     with _delay_lock:
         d = DELAY
-    return (f"⚙️ Пауза: <b>{d:.2f} с</b> (потоков: {MAX_THREADS})\n"
-            "Бот настроен на максимальную скорость проверки.")
+    ms = state.get("min_notify_score", 60)
+    grade_lbl = {0: "Все (D+)", 40: "Обычные (C+)", 60: "Необычные (B+)", 75: "Редкие (A+)", 90: "Только S"}.get(ms,
+                                                                                                                 f"от {ms}")
+    return (f"⚙️ <b>Настройки бота</b>\n\n"
+            f"⏱ Пауза: <b>{d:.2f} с</b> (потоков: {MAX_THREADS})\n"
+            f"🔔 Уведомлять о никах: <b>{grade_lbl}</b> (≥ {ms} баллов)\n"
+            f"<i>Ники ниже порога всё равно сохраняются в /found</i>")
 
 
 def settings_markup():
     kb = types.InlineKeyboardMarkup()
     kb.row(button("➖ 0.1 с", "dl:-"), button("➕ 0.1 с", "dl:+"))
+    kb.row(
+        button("Все (0)", "nt:0"),
+        button("C+ (40)", "nt:40"),
+        button("B+ (60)", "nt:60"),
+        button("A+ (75)", "nt:75"),
+    )
+    return kb
+
+
+def panel_markup():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(button("⏹ Стоп", "stop"), button("🔄 Обновить", "refresh"))
     return kb
 
 
@@ -797,6 +845,10 @@ def register_found(name):
 
 
 def announce(chat_id, name):
+    min_score = state.get("min_notify_score", 60)
+    score = rate_name(name)["score"]
+    if score < min_score:
+        return
     kb = types.InlineKeyboardMarkup()
     kb.row(button("🔄 Проверить", f"re:{name}"), button("✏️ Занять", url=ACCOUNT_URL))
     say(chat_id, f"🟢 <b>Свободен ник:</b> <code>{name}</code>\n{rating_line(name)}", kb)
@@ -928,13 +980,19 @@ def _finish_job(chat_id, job, outcome):
     persist(force=True)
     job["panel"].update(force=True, status=outcome)
     tail = f"Проверено: {num(stats['checked'])}, свободных: {stats['free']}."
+    markup = None
+
     if outcome == "done":
         text = f"🏁 Готово: {html.escape(spec['title'])}. {tail}\n/found"
+        if "ai_topic" in spec:
+            ai_last_queries[chat_id] = (spec["ai_topic"], spec.get("ai_count", AI_DEFAULT))
+            markup = types.InlineKeyboardMarkup()
+            markup.row(button("🔁 Следующая пачка ИИ", "ai_next"))
     elif outcome == "stopped":
         text = f"⏹ Остановлено на позиции {num(spec['pos'])}. {tail}\nПродолжить: /resume"
     else:
         text = f"⚠️ Превышен лимит ошибок. Пауза. {tail}\n/resume"
-    say(chat_id, text)
+    say(chat_id, text, markup=markup)
 
 
 def begin(chat_id, spec):
@@ -1068,18 +1126,7 @@ def cmd_ai(m):
         count = min(max(int(first), 10), AI_MAX)
         rest = tail.strip()
     topic = rest or "cyberpunk aesthetic"
-
-    say(m.chat.id, f"🧠 Gemini генерирует до {count} ников по теме: <b>{html.escape(topic)}</b>...")
-
-    def process_ai():
-        names, err = generate_ai_names(topic, count)
-        if not names:
-            say(m.chat.id, f"❌ Gemini не ответил.\n<code>{html.escape(err or '')}</code>")
-            return
-        say(m.chat.id, f"✅ ИИ сгенерировал {len(names)} ников. Запускаю проверку...")
-        begin(m.chat.id, new_spec("words", f"ИИ (Gemini): {topic}", len(names), words=names))
-
-    threading.Thread(target=process_ai, daemon=True).start()
+    run_ai_search(m.chat.id, topic, count)
 
 
 @bot.message_handler(commands=["rate"])
@@ -1264,6 +1311,19 @@ def on_text(m):
             say(m.chat.id, "Используй /menu или напиши ник")
 
 
+@bot.message_handler(commands=["notify"])
+def cmd_notify(m):
+    if not guard(m):
+        return
+    parts = m.text.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        val = min(max(int(parts[1]), 0), 100)
+        with state_lock:
+            state["min_notify_score"] = val
+        persist(force=True)
+    say(m.chat.id, settings_text(), settings_markup())
+
+
 @bot.callback_query_handler(func=lambda c: True)
 def on_callback(c):
     chat_id = c.message.chat.id
@@ -1287,6 +1347,21 @@ def on_callback(c):
         tg(bot.answer_callback_query, c.id, f"Пауза {DELAY:.2f}с")
         tg(bot.edit_message_text, settings_text(), chat_id=chat_id, message_id=c.message.message_id,
            parse_mode="HTML", reply_markup=settings_markup())
+    elif data.startswith("nt:"):
+        val = int(data[3:])
+        with state_lock:
+            state["min_notify_score"] = val
+        persist(force=True)
+        tg(bot.answer_callback_query, c.id, f"Порог: ≥ {val}")
+        tg(bot.edit_message_text, settings_text(), chat_id=chat_id, message_id=c.message.message_id,
+           parse_mode="HTML", reply_markup=settings_markup())
+    elif data == "ai_next":
+        last = ai_last_queries.get(chat_id)
+        if not last:
+            tg(bot.answer_callback_query, c.id, "Тема не найдена, запусти /ai заново")
+            return
+        tg(bot.answer_callback_query, c.id, "Запускаю новую пачку...")
+        run_ai_search(chat_id, last[0], last[1])
     elif data.startswith("m:"):
         tg(bot.answer_callback_query, c.id)
         action = data[2:]
@@ -1294,6 +1369,9 @@ def on_callback(c):
             start_all(chat_id, int(action[-1]))
         elif action in ("pr4", "pr5"):
             start_pretty(chat_id, int(action[-1]))
+        elif action == "cvcv":
+            names = cvcv_names()
+            begin(chat_id, new_spec("cvcv", "Все 4 буквы CVCV/VCVC", len(names)))
         elif action == "status":
             send_status(chat_id)
         elif action == "resume":
