@@ -378,12 +378,9 @@ def _load_dict():
 
 ALL_WORDS = _load_dict()
 VOWELS = "aeiouy"
-LEN_POINTS = {3: 30, 4: 26, 5: 22, 6: 17, 7: 11, 8: 9, 9: 7}
+# Жёсткие баллы за длину: всё что длиннее 5 букв почти не ценится
+LEN_POINTS = {3: 45, 4: 40, 5: 32, 6: 12, 7: 6, 8: 4, 9: 2}
 CONFUSABLE = ("il", "li", "ll", "rn", "1l", "l1", "o0", "0o", "iii", "lll")
-
-# Красивые фэнтези/латинские сочетания и редкие согласные
-AESTHETIC_DIGRAPHS = ("ae", "yl", "th", "ix", "ex", "ox", "ax", "yn", "ys", "yr", "eo", "ia", "va", "zy", "vy")
-RARE_LETTERS = set("vxzqky")
 
 
 def _pronounceable(s):
@@ -402,101 +399,79 @@ def _pronounceable(s):
     return True
 
 
-def _is_cvcvc(s):
-    """Проверяет идеальное чередование согласная-гласная (типа K-a-v-o-n)."""
-    if len(s) not in (4, 5, 6) or not s.isalpha():
-        return False
-    pattern = ["V" if c in VOWELS else "C" for c in s]
-    return all(pattern[i] != pattern[i + 1] for i in range(len(pattern) - 1))
-
-
 def _pattern_points(n):
     L = len(n)
     if L < 3:
         return 0, ""
     if len(set(n)) == 1:
-        return 22, "повтор"
+        return 25, "повтор"
     diffs = {ord(n[i + 1]) - ord(n[i]) for i in range(L - 1)}
     if n.isalpha() and diffs in ({1}, {-1}):
-        return 20, "алфавитный ряд"
+        return 22, "алфавитный ряд"
     for row in KEY_ROWS:
         if n in row or n[::-1] in row:
-            return 20, "ряд клавиатуры"
+            return 22, "ряд клавиатуры"
     if len(set(n)) == 2 and L >= 4 and all(n[i] == n[i % 2] for i in range(L)):
-        return 18, "чередование"
+        return 20, "чередование"
     if n == n[::-1]:
-        return 18, "палиндром"
+        return 20, "палиндром"
     if L % 2 == 0 and n[:L // 2] == n[L // 2:]:
-        return 15, "двойной повтор"
-    if _is_cvcvc(n):
-        return 10, "CVCVC-ритм"
+        return 16, "двойной повтор"
     return 0, ""
 
 
 def rate_name(name):
-    """Возвращает dict: score, grade, rarity, pattern, parts."""
+    """Честная оценка объективной редкости (без накрутки за красивые буквы)."""
     n = name.lower()
     L = len(n)
     core = re.sub(r"[0-9_]", "", n)
 
-    length = LEN_POINTS.get(L, 4)
+    length = LEN_POINTS.get(L, 0)
 
-    # 1. Смысл / словарность
+    # 1. Настоящее слово из словаря — главный фактор редкости
     if core in OG_WORDS:
-        meaning = 30
+        meaning = 40
     elif core in ALL_WORDS:
-        meaning = 24  # Настоящее редкое слово (как caelostat)
+        meaning = 35  # Настоящее слово из словаря (Semi-OG)
     elif _pronounceable(core):
-        meaning = 14
+        meaning = 8   # Просто выдуманное слово
     else:
-        meaning = 4
+        meaning = 0   # Каша из согласных (типа hodukq)
 
-    # 2. Паттерны и ритм
+    # 2. Строгие паттерны (только повторы, палиндромы, ряды)
     pattern, pattern_name = _pattern_points(n)
 
     # 3. Чистота символов
     if "_" in n:
-        chars = 4
+        chars = 3
     elif any(c.isdigit() for c in n):
         digit_inside = bool(re.search(r"[a-z][0-9]+[a-z]", n))
-        chars = 2 if digit_inside else 7
+        chars = 2 if digit_inside else 6
     else:
         chars = 15
 
-    # 4. Звучание и эстетика (бонус за редкие буквы и фэнтези-сочетания)
-    sound = 0
-    if _pronounceable(core):
-        sound += 10 if L <= 7 else 6
-        digraph_hits = sum(1 for d in AESTHETIC_DIGRAPHS if d in core)
-        rare_hits = sum(1 for c in set(core) if c in RARE_LETTERS)
-        sound += min(7, digraph_hits * 3 + rare_hits * 2)
-    else:
-        sound = 2
-
-    # 5. Штрафы
+    # 4. Штрафы
     penalty = 0
     if any(p in n for p in CONFUSABLE):
         penalty += 5
     if re.search(r"(.)\1\1", n) and len(set(n)) > 1:
-        penalty += 4
-    if L >= 9 and meaning < 24:
-        penalty += 4
+        penalty += 5
 
-    score = max(0, min(100, length + meaning + pattern + chars + sound - penalty))
+    score = max(0, min(100, length + meaning + pattern + chars - penalty))
 
-    if score >= 88:
+    if score >= 85:
         grade, rarity = "S", "💎 Очень редкий"
-    elif score >= 72:
+    elif score >= 70:
         grade, rarity = "A", "🔥 Редкий"
-    elif score >= 58:
+    elif score >= 55:
         grade, rarity = "B", "✨ Необычный"
-    elif score >= 40:
+    elif score >= 38:
         grade, rarity = "C", "🙂 Обычный"
     else:
         grade, rarity = "D", "🗑 Не редкий"
 
     return {"score": score, "grade": grade, "rarity": rarity, "pattern": pattern_name,
-            "parts": (length, meaning, pattern, chars, sound, penalty)}
+            "parts": (length, meaning, pattern, chars, 0, penalty)}
 
 
 def rating_line(name):
