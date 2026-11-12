@@ -1,4 +1,4 @@
 pyTelegramBotAPI
-requests
+requests[socks]
 redis
 google-genai
