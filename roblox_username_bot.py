@@ -2,11 +2,12 @@
 """
 Telegram-бот: ищет СВОБОДНЫЕ редкие ники Roblox.
 - Генерация ников через Google Gemini (официальный SDK), пачками до 1500
+- Автоматический парсинг и проверка БЕСПЛАТНЫХ HTTP/SOCKS5 прокси (до 3000 за раз + авто-пополнение)
 - Оценка ников (грейд S-D и редкость), команда /rate
 - Работает на Render и в PyCharm
 
-Установка: pip install pyTelegramBotAPI requests redis google-genai
-Переменные окружения: TG_BOT_TOKEN, TG_CHAT_ID, AI_API_KEY, (REDIS_URL, PORT, CHECK_DELAY)
+Установка: pip install pyTelegramBotAPI "requests[socks]" redis google-genai
+Переменные окружения: TG_BOT_TOKEN, TG_CHAT_ID, AI_API_KEY, (PROXIES, REDIS_URL, PORT, CHECK_DELAY)
 """
 
 import html
@@ -26,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
+from requests.adapters import HTTPAdapter
 import telebot
 from telebot import types
 
@@ -67,14 +69,13 @@ def _parse_ids(*chunks):
 
 ADMIN_IDS = _parse_ids(ADMIN_ID, os.environ.get("TG_CHAT_ID", ""))
 
-DELAY = float(os.environ.get("CHECK_DELAY", "0.5"))
-MIN_DELAY, MAX_DELAY = 0.05, 15.0
+DELAY = float(os.environ.get("CHECK_DELAY", "0.15"))
+MIN_DELAY, MAX_DELAY = 0.02, 15.0
 MAX_AUTO_DELAY = 5.0
-MAX_ERRORS = 150
-MAX_FULL = 20000
+MAX_ERRORS = 400
 MAX_WORDS = 5000
 MAX_QUICK = 25
-MAX_THREADS = 4
+MAX_THREADS = 12
 PANEL_EVERY = 10
 SAVE_EVERY = 30
 AI_DEFAULT = 300
@@ -83,6 +84,7 @@ AI_BATCH = 500
 FOUND_FILE = "found.txt"
 CHECKED_FILE = "checked.txt"
 STATE_FILE = "state.json"
+PROXY_FILE = "proxies.txt"
 REDIS_KEY = "robloxbot:state"
 ON_RENDER = bool(os.environ.get("RENDER"))
 ACCOUNT_URL = "https://www.roblox.com/my/account#!/info"
@@ -105,6 +107,8 @@ state_lock = threading.RLock()
 file_lock = threading.Lock()
 SHUTTING_DOWN = threading.Event()
 _delay_lock = threading.Lock()
+_scraping_proxies = threading.Event()
+_last_auto_scrape = 0.0
 
 
 # ============================ ХРАНИЛИЩЕ ============================
@@ -161,7 +165,8 @@ state = storage.load()
 state.setdefault("jobs", {})
 state.setdefault("found", [])
 state.setdefault("min_notify_score", 60)
-ai_last_queries = {}  # chat_id -> (topic, count)
+state.setdefault("auto_proxy", True)
+ai_last_queries = {}
 try:
     DELAY = min(max(float(state.get("delay", DELAY)), MIN_DELAY), MAX_DELAY)
 except (TypeError, ValueError):
@@ -200,6 +205,245 @@ def append_line(path, line):
                 f.write(line + "\n")
         except OSError as e:
             log.warning("Не удалось записать %s: %s", path, e)
+
+
+# ============================ БЕСПЛАТНЫЕ ПРОКСИ И АВТО-ОБНОВЛЕНИЕ ============================
+
+FREE_PROXY_SOURCES = [
+    ("http", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=all&anonymity=all"),
+    ("socks5h", "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=3000&country=all"),
+    ("http", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
+    ("socks5h", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
+    ("socks5h", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
+]
+
+
+def _test_single_proxy(proxy_url):
+    """Проверяет, открывает ли прокси API Roblox быстро и без 429."""
+    try:
+        r = requests.get(
+            URL,
+            params={"Username": "roblox", "Birthday": BIRTHDAY, "Context": "Signup"},
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=(2.0, 2.5),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+        if r.status_code == 200 and "code" in r.json():
+            return proxy_url
+    except Exception:
+        pass
+    return None
+
+
+def scrape_and_check_free_proxies(max_test=3000, max_working=250):
+    """Скачивает до 3000 публичных прокси и отбирает рабочие для Roblox."""
+    candidates = []
+    ip_port_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b")
+
+    for proto, src_url in FREE_PROXY_SOURCES:
+        try:
+            r = requests.get(src_url, timeout=8)
+            if r.status_code == 200:
+                found = ip_port_re.findall(r.text)
+                candidates.extend(f"{proto}://{hp}" for hp in found)
+        except Exception as e:
+            log.warning("Ошибка загрузки прокси с %s: %s", src_url[:45], e)
+
+    candidates = list(dict.fromkeys(candidates))
+    random.shuffle(candidates)
+    candidates = candidates[:max_test]
+
+    working = []
+    if not candidates:
+        return 0, []
+
+    with ThreadPoolExecutor(max_workers=60) as ex:
+        futures = [ex.submit(_test_single_proxy, p) for p in candidates]
+        for fut in as_completed(futures):
+            if SHUTTING_DOWN.is_set():
+                break
+            res = fut.result()
+            if res:
+                working.append(res)
+                if len(working) >= max_working:
+                    for f in futures:
+                        f.cancel()
+                    break
+
+    if working:
+        existing = load_proxies()
+        merged = list(dict.fromkeys(existing + working))
+        with file_lock:
+            try:
+                with open(PROXY_FILE, "w", encoding="utf-8") as f:
+                    f.write("\n".join(merged) + "\n")
+            except OSError as e:
+                log.warning("Не удалось сохранить %s: %s", PROXY_FILE, e)
+
+    return len(candidates), working
+
+
+def load_proxies():
+    """Загружает HTTP/SOCKS5 прокси из переменной окружения PROXIES или файла proxies.txt."""
+    raw_lines = []
+    env_proxies = os.environ.get("PROXIES", "").strip()
+    if env_proxies:
+        raw_lines.extend(re.split(r"[\s,;]+", env_proxies))
+    elif os.path.exists(PROXY_FILE):
+        try:
+            with open(PROXY_FILE, encoding="utf-8") as f:
+                raw_lines.extend(line.strip() for line in f)
+        except OSError as e:
+            log.warning("Не удалось прочитать %s: %s", PROXY_FILE, e)
+
+    cleaned = []
+    for line in raw_lines:
+        if not line or line.startswith("#"):
+            continue
+        if "://" not in line:
+            line = "http://" + line
+        cleaned.append(line)
+    return list(dict.fromkeys(cleaned))
+
+
+class SessionPool:
+    def __init__(self, min_size=MAX_THREADS):
+        self._lock = threading.Lock()
+        self._sessions = []
+        self._idx = 0
+        self.proxy_count = 0
+        self.reload(min_size)
+
+    def _build_session(self, proxy_url=None):
+        s = requests.Session()
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        s.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+        })
+        if proxy_url:
+            s.proxies.update({"http": proxy_url, "https": proxy_url})
+            s._proxy_url = proxy_url
+        else:
+            s._proxy_url = None
+        return s
+
+    def reload(self, min_size=MAX_THREADS):
+        proxies = load_proxies()
+        new_sessions = []
+        if proxies:
+            for p in proxies:
+                new_sessions.append(self._build_session(p))
+        else:
+            for _ in range(min_size):
+                new_sessions.append(self._build_session(None))
+
+        with self._lock:
+            for old_s in self._sessions:
+                try:
+                    old_s.close()
+                except Exception:
+                    pass
+            self._sessions = new_sessions
+            self._idx = 0
+            self.proxy_count = len(proxies)
+
+        if proxies:
+            log.info("Загружено прокси: %d", len(proxies))
+        else:
+            log.info("Прокси не заданы — работаю напрямую с IP сервера")
+        return len(proxies)
+
+    def drop_bad(self, bad_session):
+        """Удаляет умерший бесплатный прокси из пула на лету и обновляет файл."""
+        bad_url = getattr(bad_session, "_proxy_url", None)
+        if not bad_url:
+            return
+        with self._lock:
+            if bad_session in self._sessions:
+                self._sessions.remove(bad_session)
+                try:
+                    bad_session.close()
+                except Exception:
+                    pass
+                alive_urls = [getattr(s, "_proxy_url", None) for s in self._sessions if getattr(s, "_proxy_url", None)]
+                self.proxy_count = len(alive_urls)
+
+                if not alive_urls:
+                    self._sessions = [self._build_session(None) for _ in range(MAX_THREADS)]
+                    self.proxy_count = 0
+
+                with file_lock:
+                    try:
+                        with open(PROXY_FILE, "w", encoding="utf-8") as f:
+                            f.write(("\n".join(alive_urls) + "\n") if alive_urls else "")
+                    except OSError:
+                        pass
+
+    def get(self):
+        with self._lock:
+            s = self._sessions[self._idx % len(self._sessions)]
+            self._idx += 1
+            return s
+
+
+session_pool = SessionPool(MAX_THREADS)
+
+
+def run_free_proxy_task(chat_id=None, silent=False):
+    """Запускает сбор до 3000 прокси в фоне (ручной или автоматический)."""
+    global _last_auto_scrape
+    if _scraping_proxies.is_set():
+        if chat_id and not silent:
+            say(chat_id, "⏳ Поиск бесплатных прокси уже запущен, подожди 20–30 сек...")
+        return
+    _scraping_proxies.set()
+    _last_auto_scrape = time.time()
+
+    if chat_id and not silent:
+        say(chat_id, "🌐 Собираю до 3000 бесплатных HTTP/SOCKS5 прокси и проверяю их на доступ к Roblox (~30–45 сек)...")
+    else:
+        log.info("Авто-пополнение прокси: начинаю парсинг до 3000 узлов...")
+
+    def worker():
+        try:
+            tested, working = scrape_and_check_free_proxies(max_test=3000, max_working=250)
+            total_now = session_pool.reload(MAX_THREADS)
+            if working:
+                log.info("Авто-пополнение прокси: найдено %d рабочих (всего в пуле: %d)", len(working), total_now)
+                if chat_id:
+                    say(chat_id,
+                        f"🌐 <b>Пул прокси обновлён!</b>\n"
+                        f"Проверено: {tested} · Найдено живых: <b>+{len(working)}</b> (всего активных: <b>{total_now}</b>)",
+                        silent=silent)
+            else:
+                log.warning("Авто-пополнение прокси: живых узлов не найдено из %d", tested)
+                if chat_id and not silent:
+                    say(chat_id,
+                        f"⚠️ Из {tested} бесплатных прокси ни один не ответил быстро.\n"
+                        f"Бот продолжает работать через текущий IP.")
+        finally:
+            _scraping_proxies.clear()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def maybe_auto_refill_proxies(chat_id):
+    """Автоматически запускает поиск новых прокси, если в пуле осталось <= 2 живых."""
+    if not state.get("auto_proxy", True):
+        return
+    if _scraping_proxies.is_set():
+        return
+    if session_pool.proxy_count > 2:
+        return
+    if time.time() - _last_auto_scrape < 90:
+        return
+    run_free_proxy_task(chat_id=chat_id, silent=True)
 
 
 # ============================ НИКИ И АЛГОРИТМЫ ============================
@@ -308,10 +552,8 @@ def cvcv_names():
     cons = [c for c in LETTERS if c not in VOWELS]
     vows = list(VOWELS)
     out = []
-    # CVCV (например, kuro, vexa)
     for c1, v1, c2, v2 in itertools.product(cons, vows, cons, vows):
         out.append(c1 + v1 + c2 + v2)
-    # VCVC (например, alex, orin)
     for v1, c1, v2, c2 in itertools.product(vows, cons, vows, cons):
         out.append(v1 + c1 + v2 + c2)
     rng = random.Random(42)
@@ -324,34 +566,28 @@ def patterns_20l():
     alphabet = LETTERS + DIGITS
     out = []
 
-    # 1. 20 одинаковых символов (aaaaaaaaaaaaaaaaaaaa, 11111111111111111111)
     for ch in alphabet:
         out.append(ch * 20)
 
-    # 2. Строгое чередование ABABAB... (xoxoxoxoxoxoxoxoxoxo, 10101010101010101010)
     for a in alphabet:
         for b in alphabet:
             if a != b:
                 out.append((a + b) * 10)
 
-    # 3. Парные блоки AABBAABB... (xxyyxxyyxxyyxxyyxxyy)
     for a in LETTERS:
         for b in LETTERS:
             if a != b:
                 out.append((a * 2 + b * 2) * 5)
 
-    # 4. Зеркальные половины (10 одинаковых + 10 одинаковых)
     for a in LETTERS:
         for b in LETTERS:
             if a != b:
                 out.append(a * 10 + b * 10)
 
-    # 5. Красивые 4-буквенные корни × 5 раз (kurokurokurokurokuro)
     for root in cvcv_names()[:150]:
         out.append(root * 5)
 
-    # 6. Популярные 5-буквенные слова/ряды × 4 раза
-    roots5 = ["qwert", "asdfg", "zxcvb", "shadow"[:5], "ghost", "night", "frost", "flame",
+    roots5 = ["qwert", "asdfg", "zxcvb", "shado", "ghost", "night", "frost", "flame",
               "venom", "viper", "raven", "tiger", "chaos", "omega", "alpha", "titan", "nexus"]
     for root in roots5:
         out.append(root * 4)
@@ -394,7 +630,6 @@ OG_WORDS = {
 
 
 def _load_dict():
-    """Загружает расширенный словарь английских слов (если есть файл words_en.txt или скачивает 1 раз)."""
     dict_path = "words_en.txt"
     if not os.path.exists(dict_path):
         try:
@@ -420,7 +655,6 @@ def _load_dict():
 
 ALL_WORDS = _load_dict()
 VOWELS = "aeiouy"
-# Жёсткие баллы за длину: всё что длиннее 5 букв почти не ценится
 LEN_POINTS = {3: 45, 4: 40, 5: 32, 6: 12, 7: 6, 8: 4, 9: 2}
 CONFUSABLE = ("il", "li", "ll", "rn", "1l", "l1", "o0", "0o", "iii", "lll")
 
@@ -463,27 +697,23 @@ def _pattern_points(n):
 
 
 def rate_name(name):
-    """Честная оценка объективной редкости (без накрутки за красивые буквы)."""
     n = name.lower()
     L = len(n)
     core = re.sub(r"[0-9_]", "", n)
 
     length = LEN_POINTS.get(L, 0)
 
-    # 1. Настоящее слово из словаря — главный фактор редкости
     if core in OG_WORDS:
         meaning = 40
     elif core in ALL_WORDS:
-        meaning = 35  # Настоящее слово из словаря (Semi-OG)
+        meaning = 35
     elif _pronounceable(core):
-        meaning = 8   # Просто выдуманное слово
+        meaning = 8
     else:
-        meaning = 0   # Каша из согласных
+        meaning = 0
 
-    # 2. Строгие паттерны (только повторы, палиндромы, ряды)
     pattern, pattern_name = _pattern_points(n)
 
-    # 3. Чистота символов
     if "_" in n:
         chars = 3
     elif any(c.isdigit() for c in n):
@@ -492,14 +722,12 @@ def rate_name(name):
     else:
         chars = 15
 
-    # 4. Штрафы
     penalty = 0
     if any(p in n for p in CONFUSABLE):
         penalty += 5
     if re.search(r"(.)\1\1", n) and len(set(n)) > 1:
         penalty += 5
 
-    # Бонус для идеальных 20L-паттернов
     if L == 20 and pattern >= 16:
         length = 45
 
@@ -539,12 +767,11 @@ def rating_report(name):
 
 PREFERRED_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.5-flash"]
 _models_cache = []
-_bad_until = {}  # модель -> время, до которого её пропускаем
-_good_model = None  # последняя модель, которая ответила
+_bad_until = {}
+_good_model = None
 
 
 def pick_models():
-    """Модели, доступные ключу. Рабочая идёт первой, мёртвые и перегруженные пропускаются."""
     global _models_cache
     if not _models_cache:
         try:
@@ -596,7 +823,6 @@ def run_ai_search(chat_id, topic, count):
 
 
 def generate_ai_names(prompt_topic, count=AI_DEFAULT):
-    """Возвращает (names, error_text). Генерирует пачками, убирает дубли."""
     global _good_model
     if not ai_client:
         return [], "AI_API_KEY не задан или не установлен google-genai"
@@ -610,7 +836,7 @@ def generate_ai_names(prompt_topic, count=AI_DEFAULT):
         rounds += 1
         want = min(AI_BATCH, count - len(names) + 40)
         avoid = ", ".join(names[-40:])
-        avoid_rule = f"\n6. AVOID DUPLICATES: Do NOT include any of these: {avoid}" if avoid else ""
+        avoid_rule = f"\n5. AVOID DUPLICATES: Do NOT include any of these: {avoid}" if avoid else ""
         prompt = (
             f"You are an expert lexicographer and rare username hunter.\n"
             f"Theme/concept: '{prompt_topic}'. Generate {want} real, rare English dictionary words related to this theme.\n\n"
@@ -675,24 +901,34 @@ def fmt_duration(seconds):
 
 def check(session, name, stop, info=None):
     info = info if info is not None else {}
-    backoff = 1
-    for _ in range(3):
+    has_proxies = session_pool.proxy_count > 0
+    retries = 2 if has_proxies else 3
+    backoff = 0.5
+
+    for attempt in range(retries):
         if stop.is_set():
             return "stopped"
         try:
             r = session.get(
                 URL,
                 params={"Username": name, "Birthday": BIRTHDAY, "Context": "Signup"},
-                timeout=5,
+                timeout=(2.5, 3.5),
             )
         except requests.RequestException:
-            info["last_http"] = "нет связи"
+            info["last_http"] = "ошибка сети/прокси"
+            if has_proxies:
+                session_pool.drop_bad(session)
+                session = session_pool.get()
+                continue
             stop.wait(backoff)
             backoff = min(backoff * 2, 10)
             continue
 
         if r.status_code == 429:
             info["limited"] = info.get("limited", 0) + 1
+            if has_proxies:
+                session_pool.drop_bad(session)
+                return "limited"
             try:
                 wait = int(r.headers.get("Retry-After", backoff))
             except (TypeError, ValueError):
@@ -701,7 +937,13 @@ def check(session, name, stop, info=None):
             return "limited"
 
         if r.status_code != 200:
+            if has_proxies:
+                session_pool.drop_bad(session)
+                if attempt + 1 < retries:
+                    session = session_pool.get()
+                    continue
             return "error"
+
         try:
             code = r.json().get("code")
         except ValueError:
@@ -712,24 +954,6 @@ def check(session, name, stop, info=None):
             return "taken"
         return "blocked"
     return "error"
-
-
-class SessionPool:
-    def __init__(self, size):
-        self._sessions = [requests.Session() for _ in range(size)]
-        for s in self._sessions:
-            s.headers.update({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept-Encoding": "gzip, deflate",
-            })
-        self._lock = threading.Lock()
-        self._idx = 0
-
-    def get(self):
-        with self._lock:
-            s = self._sessions[self._idx % len(self._sessions)]
-            self._idx += 1
-            return s
 
 
 def tg(fn, *args, **kwargs):
@@ -772,15 +996,20 @@ def settings_text():
         d = DELAY
     ms = state.get("min_notify_score", 60)
     grade_lbl = {0: "Все (D+)", 38: "Обычные (C+)", 55: "Необычные (B+)", 70: "Редкие (A+)", 85: "Только S"}.get(ms, f"от {ms}")
+    px = session_pool.proxy_count
+    px_text = f"<b>{px} живых</b>" if px else "0 (прямой IP)"
+    auto_lbl = "ВКЛ ✅" if state.get("auto_proxy", True) else "ВЫКЛ ❌"
     return (f"⚙️ <b>Настройки бота</b>\n\n"
             f"⏱ Пауза: <b>{d:.2f} с</b> (потоков: {MAX_THREADS})\n"
+            f"🌐 Прокси: {px_text} · Авто-сбор: <b>{auto_lbl}</b>\n"
             f"🔔 Уведомлять о никах: <b>{grade_lbl}</b> (≥ {ms} баллов)\n"
             f"<i>Ники ниже порога всё равно сохраняются в /found</i>")
 
 
 def settings_markup():
     kb = types.InlineKeyboardMarkup()
-    kb.row(button("➖ 0.1 с", "dl:-"), button("➕ 0.1 с", "dl:+"))
+    kb.row(button("➖ 0.05 с", "dl:-"), button("➕ 0.05 с", "dl:+"), button("🤖 Авто-прокси", "px:auto"))
+    kb.row(button("🆓 Найти прокси (3000)", "px:free"), button("🔄 Перечитать файл", "px:reload"))
     kb.row(
         button("Все (0)", "nt:0"),
         button("C+ (38)", "nt:38"),
@@ -829,13 +1058,19 @@ class Panel:
         rate = moved / elapsed if (elapsed > 10 and moved >= 5) else MAX_THREADS / (delay + 0.1)
         eta = (total - pos) / rate if rate > 0 else 0
         head = {None: "⏳", "done": "🏁", "stopped": "⏸", "blocked": "⚠️", "crashed": "💥"}[status]
+        if _scraping_proxies.is_set():
+            px_tag = f" · прокси: {session_pool.proxy_count} (ищу новые...)"
+        elif session_pool.proxy_count:
+            px_tag = f" · прокси: {session_pool.proxy_count}"
+        else:
+            px_tag = ""
         lines = [
             f"{head} <b>{html.escape(spec['title'])}</b>",
             f"{bar(frac)} {frac * 100:.1f}%  ({num(pos)} из {num(total)})",
             f"🟢 Свободных: <b>{st['free']}</b>    ·    проверено: {num(st['checked'])}",
         ]
         if status is None:
-            lines.append(f"⚡ ~{rate * 60:.0f} ников/мин (потоков: {MAX_THREADS})")
+            lines.append(f"⚡ ~{rate * 60:.0f} ников/мин (потоков: {MAX_THREADS}{px_tag})")
             lines.append(f"🕒 Осталось: {fmt_duration(eta)}")
         if st["limited"]:
             lines.append(f"🚦 Лимитов (429): {st['limited']}")
@@ -885,10 +1120,13 @@ def run_job(chat_id, job):
     panel.send()
     persist(force=True)
 
+    # Если при старте пул прокси пуст — запускаем авто-сбор в фоне
+    maybe_auto_refill_proxies(chat_id)
+
     base = spec["pos"]
     name_iterator = make_names(spec)
+    retry_queue = []
     outcome = "done"
-    session_pool = SessionPool(MAX_THREADS)
 
     def worker_check(args):
         idx, name = args
@@ -905,20 +1143,20 @@ def run_job(chat_id, job):
 
         job["current"] = name
         status = check(session, name, job["stop"], job)
-
-        if status == "free":
-            time.sleep(0.1)
-            again = check(session, name, job["stop"], job)
-            if again in ("taken", "blocked"):
-                status = again
         return idx, name, status
 
     try:
-        chunk_size = MAX_THREADS * 5
+        chunk_size = MAX_THREADS * 6
         with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
             while not job["stop"].is_set():
+                # Автоматически пополняем прокси, когда живых остаётся <= 2
+                maybe_auto_refill_proxies(chat_id)
+
                 batch = []
-                for _ in range(chunk_size):
+                while retry_queue and len(batch) < chunk_size:
+                    batch.append(retry_queue.pop(0))
+
+                while len(batch) < chunk_size:
                     try:
                         name = next(name_iterator)
                         batch.append((base, name))
@@ -935,22 +1173,28 @@ def run_job(chat_id, job):
                         break
                     try:
                         idx, name, status = future.result()
-                        spec["pos"] = idx + 1
+                        if idx >= spec["pos"]:
+                            spec["pos"] = idx + 1
 
                         if status == "stopped":
                             outcome = "stopped"
                             break
                         if status == "error":
                             job["errors"] += 1
-                            job["delay"] = min(job["delay"] * 1.5 + 0.3, MAX_AUTO_DELAY)
-                            job["stop"].wait(1.5)
+                            if session_pool.proxy_count == 0:
+                                job["delay"] = min(job["delay"] * 1.5 + 0.3, MAX_AUTO_DELAY)
+                                job["stop"].wait(1.0)
+                            else:
+                                retry_queue.append((idx, name))
                             if job["errors"] >= MAX_ERRORS:
                                 outcome = "blocked"
                                 break
                             continue
                         if status == "limited":
                             stats["limited"] += 1
-                            job["delay"] = min(job["delay"] * 1.2 + 0.1, MAX_AUTO_DELAY)
+                            retry_queue.append((idx, name))
+                            if session_pool.proxy_count == 0:
+                                job["delay"] = min(job["delay"] * 1.2 + 0.1, MAX_AUTO_DELAY)
                             continue
 
                         job["errors"] = 0
@@ -1101,6 +1345,8 @@ def guard(m):
 HELP = (
     "<b>Бот для поиска редких ников в Roblox</b>\n\n"
     "/menu — главное меню\n"
+    "/freeproxy — спарсить и проверить до 3000 бесплатных прокси\n"
+    "/reload — перечитать proxies.txt\n"
     f"<code>/ai [число] [тема]</code> — подобрать редкие словарные слова через Gemini и проверить "
     f"(по умолчанию {AI_DEFAULT}, максимум {AI_MAX}). Пример: <code>/ai 500 astronomy</code>\n"
     "<code>/rate ник</code> — оценить реальную редкость ника\n"
@@ -1130,6 +1376,20 @@ def cmd_start(m):
 def cmd_help(m):
     if guard(m):
         say(m.chat.id, HELP)
+
+
+@bot.message_handler(commands=["freeproxy"])
+def cmd_freeproxy(m):
+    if guard(m):
+        run_free_proxy_task(m.chat.id, silent=False)
+
+
+@bot.message_handler(commands=["reload"])
+def cmd_reload(m):
+    if not guard(m):
+        return
+    cnt = session_pool.reload(MAX_THREADS)
+    say(m.chat.id, f"🌐 Пул обновлён. Загружено прокси: <b>{cnt}</b>")
 
 
 @bot.message_handler(commands=["ai"])
@@ -1222,13 +1482,13 @@ def on_document(m):
 
 
 def quick_check(chat_id, names):
-    session = requests.Session()
     never = threading.Event()
     lines = []
     for name in names[:MAX_QUICK]:
         if not valid_format(name):
             lines.append(f"⚪ <code>{html.escape(name)}</code> — неверный формат")
             continue
+        session = session_pool.get()
         st = check(session, name, never)
         label = {
             "free": f"🟢 <code>{name}</code> — свободен · {rating_line(name)}",
@@ -1236,7 +1496,7 @@ def quick_check(chat_id, names):
             "blocked": f"⛔ <code>{name}</code> — запрещен",
         }.get(st, f"⚠️ <code>{name}</code> — ошибка")
         lines.append(label)
-        time.sleep(0.1)
+        time.sleep(0.05)
     say(chat_id, "\n".join(lines))
 
 
@@ -1365,8 +1625,23 @@ def on_callback(c):
         tg(bot.answer_callback_query, c.id, "Проверяю...")
         start_quick(chat_id, [data[3:]])
     elif data in ("dl:+", "dl:-"):
-        set_delay(DELAY + (0.1 if data == "dl:+" else -0.1))
+        set_delay(DELAY + (0.05 if data == "dl:+" else -0.05))
         tg(bot.answer_callback_query, c.id, f"Пауза {DELAY:.2f}с")
+        tg(bot.edit_message_text, settings_text(), chat_id=chat_id, message_id=c.message.message_id,
+           parse_mode="HTML", reply_markup=settings_markup())
+    elif data == "px:auto":
+        with state_lock:
+            state["auto_proxy"] = not state.get("auto_proxy", True)
+        persist(force=True)
+        tg(bot.answer_callback_query, c.id, "Авто-прокси переключено")
+        tg(bot.edit_message_text, settings_text(), chat_id=chat_id, message_id=c.message.message_id,
+           parse_mode="HTML", reply_markup=settings_markup())
+    elif data == "px:free":
+        tg(bot.answer_callback_query, c.id, "Запускаю сбор 3000 прокси...")
+        run_free_proxy_task(chat_id, silent=False)
+    elif data == "px:reload":
+        cnt = session_pool.reload(MAX_THREADS)
+        tg(bot.answer_callback_query, c.id, f"Прокси: {cnt}")
         tg(bot.edit_message_text, settings_text(), chat_id=chat_id, message_id=c.message.message_id,
            parse_mode="HTML", reply_markup=settings_markup())
     elif data.startswith("nt:"):
