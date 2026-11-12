@@ -67,14 +67,14 @@ def _parse_ids(*chunks):
 
 ADMIN_IDS = _parse_ids(ADMIN_ID, os.environ.get("TG_CHAT_ID", ""))
 
-DELAY = float(os.environ.get("CHECK_DELAY", "0.2"))
+DELAY = float(os.environ.get("CHECK_DELAY", "0.5"))
 MIN_DELAY, MAX_DELAY = 0.05, 15.0
 MAX_AUTO_DELAY = 5.0
-MAX_ERRORS = 50
+MAX_ERRORS = 150
 MAX_FULL = 20000
 MAX_WORDS = 5000
 MAX_QUICK = 25
-MAX_THREADS = 10
+MAX_THREADS = 4
 PANEL_EVERY = 10
 SAVE_EVERY = 30
 AI_DEFAULT = 300
@@ -868,6 +868,8 @@ def run_job(chat_id, job):
                             break
                         if status == "error":
                             job["errors"] += 1
+                            job["delay"] = min(job["delay"] * 1.5 + 0.3, MAX_AUTO_DELAY)
+                            job["stop"].wait(1.5)
                             if job["errors"] >= MAX_ERRORS:
                                 outcome = "blocked"
                                 break
