@@ -459,6 +459,8 @@ def pattern_options(pattern):
             opts.append(LETTERS)
         elif ch == "#":
             opts.append(DIGITS)
+        elif ch == "_":
+            opts.append("_")
         else:
             opts.append(ch)
     return opts
