@@ -504,7 +504,7 @@ def generate_ai_names(prompt_topic, count=AI_DEFAULT):
             f"Take the theme: '{prompt_topic}' and transform it into {count} rare, clean usernames.\n\n"
             f"STRICT RULES FOR GENERATION:\n"
             f"1. THEMATIC VARIATIONS: Derive unique roots, Latin/Greek stems, and stylistic variations from the concept '{prompt_topic}'.\n"
-            f"2. TARGET LENGTHS: Strictly output names from 4 to 8 letters long (balanced mix of 4, 5, 6, 7, and 8 letters).\n"
+            f"2. TARGET LENGTHS: Strictly output names from 4 to 10 letters long (balanced mix of 4, 5, 6, 7, 8, 9, and 10 letters).\n"
             f"3. CLEAN ONLY: Only Latin letters (A-Z). ABSOLUTELY NO numbers, NO underscores, NO trash like 'xX', 'pro', 'yt', '123'.\n"
             f"4. PHONETICS: Must sound premium and pronounceable (e.g., theme 'shadow' -> 'gloom', 'umbra', 'nyxian', 'gloomix', 'shadowed').\n"
             f"5. OUTPUT FORMAT: Return ONLY raw usernames separated by spaces or newlines. No numbers, no markdown, no bullets."
