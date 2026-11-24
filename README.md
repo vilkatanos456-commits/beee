@@ -55,3 +55,4 @@ Telegram-бот на Python для поиска свободных ников в
 .
 ├── roblox_username_bot.py   # Основной код бота, генераторы, оценка ников, прокси и polling
 └── requirements.txt         # Зависимости Python
+Примечание: во время работы бот также может создавать локальные файлы state.json, found.txt, checked.txt, proxies.txt и words_en.txt (если не используется Redis или скачивается словарь) — перед публикацией репозитория стоит добавить их в .gitignore[cite: 9].
