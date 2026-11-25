@@ -76,6 +76,8 @@ MAX_ERRORS = 400
 MAX_WORDS = 5000
 MAX_QUICK = 25
 MAX_THREADS = 12
+MAX_SCAN = 200000          # потолок перебора для /scan (иначе product съедает память)
+MAX_RETRIES_PER_NAME = 3   # сколько раз повторять ник после 429
 PANEL_EVERY = 10
 SAVE_EVERY = 30
 AI_DEFAULT = 300
@@ -216,7 +218,7 @@ FREE_PROXY_SOURCES = [
     ("socks5h", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
     ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
     ("socks5h", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
-    ("http", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
+    ("socks5h", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
 ]
 
 
@@ -478,9 +480,21 @@ def gen_pattern(opts, n, seed):
                 seen.add(name)
                 yield name
         return
-    names = ["".join(p) for p in itertools.product(*opts)]
-    rng.shuffle(names)
-    yield from names
+    total = 1
+    for o in opts:
+        total *= len(o)
+    if total <= MAX_SCAN:
+        names = ["".join(p) for p in itertools.product(*opts)]
+        rng.shuffle(names)
+        yield from names
+        return
+    # слишком много вариантов — сэмплируем, не материализуя весь product
+    seen = set()
+    while len(seen) < MAX_SCAN:
+        name = "".join(rng.choice(o) for o in opts)
+        if name not in seen:
+            seen.add(name)
+            yield name
 
 
 def gen_all(length, start_i=0):
@@ -929,7 +943,7 @@ def check(session, name, stop, info=None):
         if r.status_code == 429:
             info["limited"] = info.get("limited", 0) + 1
             if has_proxies:
-                session_pool.drop_bad(session)
+                # 429 — это лимит Roblox, а не мёртвый прокси: не выбрасываем его из пула
                 return "limited"
             try:
                 wait = int(r.headers.get("Retry-After", backoff))
@@ -1128,6 +1142,7 @@ def run_job(chat_id, job):
     base = spec["pos"]
     name_iterator = make_names(spec)
     retry_queue = []
+    attempts = {}
     outcome = "done"
 
     def worker_check(args):
@@ -1194,7 +1209,15 @@ def run_job(chat_id, job):
                             continue
                         if status == "limited":
                             stats["limited"] += 1
-                            retry_queue.append((idx, name))
+                            attempts[name] = attempts.get(name, 0) + 1
+                            if attempts[name] <= MAX_RETRIES_PER_NAME:
+                                retry_queue.append((idx, name))
+                            else:
+                                # исчерпали попытки: не крутим один ник бесконечно
+                                stats["checked"] += 1
+                                if not is_file_or_custom:
+                                    checked.add(name)
+                                    append_line(CHECKED_FILE, name)
                             if session_pool.proxy_count == 0:
                                 job["delay"] = min(job["delay"] * 1.2 + 0.1, MAX_AUTO_DELAY)
                             continue
@@ -1464,6 +1487,14 @@ def cmd_scan(m):
         pattern = args[0].lower()
         n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 0
         full = math.prod(len(o) for o in pattern_options(pattern))
+        if full > MAX_SCAN:
+            bot.reply_to(
+                m,
+                f"⚠️ Слишком много вариантов: {full:,}.\n"
+                f"Уточни шаблон (например <code>????a</code>) или задай количество: "
+                f"<code>/scan {pattern} {MAX_SCAN}</code>",
+                parse_mode="HTML")
+            return
         begin(m.chat.id,
               new_spec("scan", f"Шаблон {pattern}", n or full, pattern=pattern, n=n, seed=random.randrange(2 ** 31)))
 
